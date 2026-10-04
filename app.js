@@ -1,0 +1,1924 @@
+(() => {
+    'use strict';
+    const STORAGE_KEY = 'tutornote_v1';
+    const ADMIN_KEY = 'tutornote_admin_v1';
+    const BACKUP_META_KEY = 'tutornote_backup_meta_v1';
+    const BACKUP_DB = 'TutorNoteSafety';
+    const BACKUP_STORE = 'backups';
+    const MAX_BACKUPS = 50;
+    const CLOUD_CONFIG_KEY = 'tutornote_cloud_config_v1';
+    const CLOUD_SESSION_KEY = 'tutornote_cloud_session_v1';
+    const CLOUD_MASTER_KEY = 'tutornote_cloud_master_v1';
+    const CLOUD_META_KEY = 'tutornote_cloud_meta_v1';
+    const CLOUD_MIN_INTERVAL = 30000;
+    const $ = (s, root = document) => root.querySelector(s);
+    const $$ = (s, root = document) => [...root.querySelectorAll(s)];
+    const pad = n => String(n).padStart(2, '0');
+    const todayISO = () => {
+        const d = new Date();
+        return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+    };
+    const uid = (prefix = 'id') => `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+    const escapeHTML = value => String(value !== null && value !== void 0 ? value : '').replace(/[&<>'"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#039;', '"': '&quot;' }[ch]));
+    const initials = name => String(name || 'U').trim().split(/\s+/).slice(0, 2).map(x => { var _a; return ((_a = x[0]) === null || _a === void 0 ? void 0 : _a.toUpperCase()) || ''; }).join('') || 'U';
+    const toMinutes = time => {
+        const [h, m] = String(time || '00:00').split(':').map(Number);
+        return h * 60 + m;
+    };
+    const addMinutesToTime = (time, mins) => {
+        const total = toMinutes(time) + Number(mins || 0);
+        return `${pad(Math.floor(total / 60) % 24)}:${pad(total % 60)}`;
+    };
+    const localeDate = (iso, opts = { day: '2-digit', month: 'short' }) => new Intl.DateTimeFormat('uk-UA', opts).format(new Date(`${iso}T12:00:00`));
+    const money = n => new Intl.NumberFormat('uk-UA', { style: 'currency', currency: 'UAH', maximumFractionDigits: 0 }).format(Number(n || 0));
+    const capitalize = s => s ? s[0].toUpperCase() + s.slice(1) : s;
+    const blankState = () => ({
+        version: 4,
+        tutor: { name: 'Мій TutorNote', dark: false },
+        students: [],
+        groups: [],
+        lessons: [],
+        payments: [],
+        packages: [],
+        trash: [],
+        recurrenceExceptions: []
+    });
+    function loadState() {
+        try {
+            const raw = localStorage.getItem(STORAGE_KEY);
+            if (!raw)
+                return blankState();
+            const parsed = JSON.parse(raw);
+            return Object.assign(Object.assign(Object.assign({}, blankState()), parsed), { tutor: Object.assign(Object.assign({}, blankState().tutor), (parsed.tutor || {})), students: Array.isArray(parsed.students) ? parsed.students : [], groups: Array.isArray(parsed.groups) ? parsed.groups : [], lessons: Array.isArray(parsed.lessons) ? parsed.lessons.map(l => Object.assign({}, l, { status: l.status === 'cancelled' ? 'cancelled_student' : (l.status || 'planned') })) : [], payments: Array.isArray(parsed.payments) ? parsed.payments : [], packages: Array.isArray(parsed.packages) ? parsed.packages : [], trash: Array.isArray(parsed.trash) ? parsed.trash : [], recurrenceExceptions: Array.isArray(parsed.recurrenceExceptions) ? parsed.recurrenceExceptions : [] });
+        }
+        catch (e) {
+            console.warn('TutorNote: storage read error', e);
+            return blankState();
+        }
+    }
+    let state = loadState();
+    let currentPage = 'home';
+    let peopleView = 'students';
+    let selectedDate = todayISO();
+    let calendarView = 'week';
+    let pendingRecurringChange = null;
+    let paymentRange = '6m';
+    let deferredPrompt = null;
+    let toastTimer = null;
+    const app = $('#app');
+    const modalBackdrop = $('#modalBackdrop');
+    const modalBody = $('#modalBody');
+    const modalTitle = $('#modalTitle');
+    const pageTitle = $('#pageTitle');
+    const fab = $('#fab');
+    const installBtn = $('#installBtn');
+    let lastBackupFingerprint = '';
+    function save(reason = 'Зміна даних') {
+        try {
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+            scheduleAutoBackup(reason);
+            scheduleCloudBackup(reason);
+            return true;
+        }
+        catch (e) {
+            console.warn('TutorNote: storage write error', e);
+            toast('iPhone не дозволив запис у сховище. Відкрийте TutorNote у Safari / з головного екрана.');
+            return false;
+        }
+    }
+    function openBackupDB() {
+        return new Promise((resolve, reject) => {
+            if (!window.indexedDB) { reject(new Error('IndexedDB unavailable')); return; }
+            const req = indexedDB.open(BACKUP_DB, 1);
+            req.onupgradeneeded = () => {
+                const db = req.result;
+                if (!db.objectStoreNames.contains(BACKUP_STORE)) db.createObjectStore(BACKUP_STORE, { keyPath: 'id' });
+            };
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => reject(req.error || new Error('Backup DB error'));
+        });
+    }
+    async function createAutoBackup(reason = 'Автокопія', force = false) {
+        try {
+            const snapshotText = JSON.stringify(state);
+            if (!force && snapshotText === lastBackupFingerprint) return;
+            const db = await openBackupDB();
+            const record = { id: uid('b'), createdAt: new Date().toISOString(), reason, snapshot: JSON.parse(snapshotText) };
+            await new Promise((resolve, reject) => {
+                const tx = db.transaction(BACKUP_STORE, 'readwrite');
+                tx.objectStore(BACKUP_STORE).put(record);
+                tx.oncomplete = resolve;
+                tx.onerror = () => reject(tx.error || new Error('Backup write error'));
+            });
+            const all = await new Promise((resolve, reject) => {
+                const tx = db.transaction(BACKUP_STORE, 'readonly');
+                const req = tx.objectStore(BACKUP_STORE).getAll();
+                req.onsuccess = () => resolve(req.result || []);
+                req.onerror = () => reject(req.error || new Error('Backup read error'));
+            });
+            if (all.length > MAX_BACKUPS) {
+                all.sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
+                const remove = all.slice(0, all.length - MAX_BACKUPS);
+                await new Promise((resolve, reject) => {
+                    const tx = db.transaction(BACKUP_STORE, 'readwrite');
+                    const store = tx.objectStore(BACKUP_STORE);
+                    remove.forEach(x => store.delete(x.id));
+                    tx.oncomplete = resolve;
+                    tx.onerror = () => reject(tx.error || new Error('Backup trim error'));
+                });
+            }
+            db.close();
+            lastBackupFingerprint = snapshotText;
+            localStorage.setItem(BACKUP_META_KEY, JSON.stringify({ lastAt: record.createdAt, reason: record.reason }));
+        }
+        catch (e) {
+            console.warn('TutorNote: automatic backup error', e);
+        }
+    }
+    let backupTimer = null;
+    function scheduleAutoBackup(reason) {
+        clearTimeout(backupTimer);
+        backupTimer = setTimeout(() => createAutoBackup(reason), 250);
+    }
+    async function getBackups() {
+        try {
+            const db = await openBackupDB();
+            const all = await new Promise((resolve, reject) => {
+                const tx = db.transaction(BACKUP_STORE, 'readonly');
+                const req = tx.objectStore(BACKUP_STORE).getAll();
+                req.onsuccess = () => resolve(req.result || []);
+                req.onerror = () => reject(req.error || new Error('Backup read error'));
+            });
+            db.close();
+            return all.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+        } catch (e) { return []; }
+    }
+    function backupMetaText() {
+        try {
+            const meta = JSON.parse(localStorage.getItem(BACKUP_META_KEY) || 'null');
+            if (!meta || !meta.lastAt) return 'Ще не створювалася';
+            return new Intl.DateTimeFormat('uk-UA', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }).format(new Date(meta.lastAt));
+        } catch (e) { return 'Увімкнено'; }
+    }
+    function getCloudConfig() {
+        try { return JSON.parse(localStorage.getItem(CLOUD_CONFIG_KEY) || 'null'); } catch (e) { return null; }
+    }
+    function setCloudConfig(config) {
+        localStorage.setItem(CLOUD_CONFIG_KEY, JSON.stringify(config));
+    }
+    function getCloudSession() {
+        try { return JSON.parse(localStorage.getItem(CLOUD_SESSION_KEY) || 'null'); } catch (e) { return null; }
+    }
+    function setCloudSession(session) {
+        if (!session) localStorage.removeItem(CLOUD_SESSION_KEY);
+        else localStorage.setItem(CLOUD_SESSION_KEY, JSON.stringify(session));
+    }
+    function getCloudMeta() {
+        try { return JSON.parse(localStorage.getItem(CLOUD_META_KEY) || '{}') || {}; } catch (e) { return {}; }
+    }
+    function setCloudMeta(patch) {
+        const next = Object.assign({}, getCloudMeta(), patch || {});
+        localStorage.setItem(CLOUD_META_KEY, JSON.stringify(next));
+        return next;
+    }
+    function bytesToB64(bytes) {
+        let binary = '';
+        const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+        for (let i = 0; i < arr.length; i += 0x8000) binary += String.fromCharCode.apply(null, arr.subarray(i, i + 0x8000));
+        return btoa(binary);
+    }
+    function b64ToBytes(value) {
+        const binary = atob(String(value || ''));
+        const out = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+        return out;
+    }
+    async function sha256Hex(text) {
+        const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+        return Array.from(new Uint8Array(digest)).map(x => x.toString(16).padStart(2, '0')).join('');
+    }
+    async function importAesKey(bytes) {
+        return crypto.subtle.importKey('raw', bytes, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+    }
+    async function deriveWrapKey(passphrase, salt, iterations) {
+        const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(passphrase), 'PBKDF2', false, ['deriveKey']);
+        return crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations, hash: 'SHA-256' }, base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+    }
+    async function encryptBytes(bytes, key) {
+        const iv = crypto.getRandomValues(new Uint8Array(12));
+        const encrypted = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, bytes);
+        return { iv: bytesToB64(iv), ciphertext: bytesToB64(new Uint8Array(encrypted)) };
+    }
+    async function decryptBytes(ciphertext, iv, key) {
+        const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64ToBytes(iv) }, key, b64ToBytes(ciphertext));
+        return new Uint8Array(decrypted);
+    }
+    function cloudConfigured() {
+        const c = getCloudConfig();
+        return !!(c && c.url && c.key);
+    }
+    function cloudStatusText() {
+        const cfg = getCloudConfig();
+        if (!cfg || !cfg.url || !cfg.key) return 'Не налаштовано';
+        const session = getCloudSession();
+        if (!session || !session.access_token) return 'Проєкт підключено • потрібен вхід';
+        const meta = getCloudMeta();
+        if (meta.lastAt) {
+            try { return 'Зашифровано • остання копія ' + new Intl.DateTimeFormat('uk-UA', { day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit' }).format(new Date(meta.lastAt)); } catch (e) { }
+        }
+        return localStorage.getItem(CLOUD_MASTER_KEY) ? 'Готово до автокопій' : 'Потрібен ключ відновлення';
+    }
+    function normalizeCloudUrl(url) {
+        return String(url || '').trim().replace(/\/+$/, '');
+    }
+    async function cloudRawFetch(path, options, authenticated) {
+        const cfg = getCloudConfig();
+        if (!cfg || !cfg.url || !cfg.key) throw new Error('Спочатку налаштуйте хмарний проєкт');
+        const headers = Object.assign({ 'apikey': cfg.key, 'Content-Type': 'application/json' }, (options && options.headers) || {});
+        if (authenticated) {
+            const session = await ensureCloudSession();
+            if (!session || !session.access_token) throw new Error('Потрібно увійти в хмарний обліковий запис');
+            headers.Authorization = 'Bearer ' + session.access_token;
+        }
+        const resp = await fetch(cfg.url + path, Object.assign({}, options || {}, { headers }));
+        let body = null;
+        const text = await resp.text();
+        if (text) { try { body = JSON.parse(text); } catch (e) { body = text; } }
+        if (!resp.ok) {
+            const msg = body && (body.msg || body.message || body.error_description || body.error) ? (body.msg || body.message || body.error_description || body.error) : ('HTTP ' + resp.status);
+            throw new Error(msg);
+        }
+        return body;
+    }
+    async function cloudSignUp(email, password) {
+        const result = await cloudRawFetch('/auth/v1/signup', { method: 'POST', body: JSON.stringify({ email, password }) }, false);
+        if (result && result.access_token) saveAuthResponse(result);
+        return result;
+    }
+    async function cloudSignIn(email, password) {
+        const result = await cloudRawFetch('/auth/v1/token?grant_type=password', { method: 'POST', body: JSON.stringify({ email, password }) }, false);
+        saveAuthResponse(result);
+        return result;
+    }
+    function saveAuthResponse(result) {
+        if (!result || !result.access_token) return;
+        const old = getCloudSession() || {};
+        const session = {
+            access_token: result.access_token,
+            refresh_token: result.refresh_token || old.refresh_token || '',
+            expires_at: Math.floor(Date.now() / 1000) + Number(result.expires_in || 3600) - 30,
+            user: result.user || old.user || null
+        };
+        setCloudSession(session);
+    }
+    async function ensureCloudSession() {
+        let session = getCloudSession();
+        if (!session || !session.access_token) return null;
+        if (!session.expires_at || Number(session.expires_at) > Math.floor(Date.now()/1000) + 60) return session;
+        if (!session.refresh_token) return null;
+        try {
+            const cfg = getCloudConfig();
+            const resp = await fetch(cfg.url + '/auth/v1/token?grant_type=refresh_token', {
+                method: 'POST',
+                headers: { 'apikey': cfg.key, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ refresh_token: session.refresh_token })
+            });
+            const result = await resp.json();
+            if (!resp.ok || !result.access_token) throw new Error(result.message || result.error_description || 'Не вдалося оновити сесію');
+            saveAuthResponse(Object.assign({}, result, { user: result.user || session.user }));
+            return getCloudSession();
+        } catch (e) {
+            console.warn('TutorNote cloud refresh error', e);
+            return null;
+        }
+    }
+    async function cloudDb(path, options) {
+        return cloudRawFetch('/rest/v1/' + path, options || {}, true);
+    }
+    function cloudUserId() {
+        const session = getCloudSession();
+        return session && session.user && session.user.id ? session.user.id : '';
+    }
+    async function getCloudProfile() {
+        const rows = await cloudDb('tutornote_cloud_profiles?select=*&limit=1', { method: 'GET' });
+        return Array.isArray(rows) && rows.length ? rows[0] : null;
+    }
+    async function upsertCloudProfile(profile) {
+        return cloudDb('tutornote_cloud_profiles?on_conflict=user_id', {
+            method: 'POST',
+            headers: { 'Prefer': 'resolution=merge-duplicates,return=representation' },
+            body: JSON.stringify(profile)
+        });
+    }
+    async function createCloudEncryption(passphrase) {
+        if (!window.crypto || !crypto.subtle) throw new Error('Цей браузер не підтримує Web Crypto');
+        if (String(passphrase || '').length < 12) throw new Error('Фраза відновлення має містити щонайменше 12 символів');
+        const master = crypto.getRandomValues(new Uint8Array(32));
+        const salt = crypto.getRandomValues(new Uint8Array(16));
+        const iterations = 250000;
+        const wrapKey = await deriveWrapKey(passphrase, salt, iterations);
+        const wrapped = await encryptBytes(master, wrapKey);
+        const userId = cloudUserId();
+        if (!userId) throw new Error('Потрібно увійти');
+        await upsertCloudProfile({ user_id: userId, wrapped_key: wrapped.ciphertext, wrap_iv: wrapped.iv, wrap_salt: bytesToB64(salt), kdf_iterations: iterations, updated_at: new Date().toISOString() });
+        localStorage.setItem(CLOUD_MASTER_KEY, bytesToB64(master));
+        setCloudMeta({ keyReady: true });
+        return true;
+    }
+    async function recoverCloudEncryption(passphrase) {
+        const profile = await getCloudProfile();
+        if (!profile) throw new Error('Хмарний ключ не знайдено. Створіть новий ключ відновлення.');
+        const salt = b64ToBytes(profile.wrap_salt);
+        const wrapKey = await deriveWrapKey(passphrase, salt, Number(profile.kdf_iterations || 250000));
+        let raw;
+        try { raw = await decryptBytes(profile.wrapped_key, profile.wrap_iv, wrapKey); }
+        catch (e) { throw new Error('Невірна фраза відновлення'); }
+        if (raw.length !== 32) throw new Error('Хмарний ключ пошкоджено');
+        localStorage.setItem(CLOUD_MASTER_KEY, bytesToB64(raw));
+        setCloudMeta({ keyReady: true });
+        return true;
+    }
+    async function cloudMasterKey() {
+        const raw = localStorage.getItem(CLOUD_MASTER_KEY);
+        if (!raw) return null;
+        try { return await importAesKey(b64ToBytes(raw)); } catch (e) { return null; }
+    }
+    async function cloudBackupNow(reason, force) {
+        if (!cloudConfigured() || !navigator.onLine) return false;
+        const session = await ensureCloudSession();
+        const key = await cloudMasterKey();
+        if (!session || !key) return false;
+        const snapshotText = JSON.stringify(state);
+        const fingerprint = await sha256Hex(snapshotText);
+        const meta = getCloudMeta();
+        if (!force && meta.lastHash === fingerprint) return true;
+        try {
+            const encrypted = await encryptBytes(new TextEncoder().encode(snapshotText), key);
+            await cloudDb('tutornote_backups', {
+                method: 'POST',
+                headers: { 'Prefer': 'return=minimal' },
+                body: JSON.stringify({
+                    user_id: cloudUserId(),
+                    reason: String(reason || 'Автокопія').slice(0, 120),
+                    ciphertext: encrypted.ciphertext,
+                    iv: encrypted.iv,
+                    snapshot_sha256: fingerprint,
+                    app_version: 4,
+                    device_name: /iPhone|iPad|iPod/i.test(navigator.userAgent) ? 'iPhone/iPad PWA' : 'Browser PWA'
+                })
+            });
+            setCloudMeta({ lastAt: new Date().toISOString(), lastHash: fingerprint, lastError: '', pending: false });
+            return true;
+        } catch (e) {
+            console.warn('TutorNote cloud backup error', e);
+            setCloudMeta({ lastError: e.message || String(e), pending: true });
+            return false;
+        }
+    }
+    let cloudBackupTimer = null;
+    function scheduleCloudBackup(reason) {
+        if (!cloudConfigured()) return;
+        setCloudMeta({ pending: true, pendingReason: reason || 'Автокопія' });
+        clearTimeout(cloudBackupTimer);
+        const meta = getCloudMeta();
+        const last = meta.lastAt ? new Date(meta.lastAt).getTime() : 0;
+        const wait = Math.max(2000, CLOUD_MIN_INTERVAL - Math.max(0, Date.now() - last));
+        cloudBackupTimer = setTimeout(async () => {
+            const m = getCloudMeta();
+            await cloudBackupNow(m.pendingReason || reason || 'Автокопія', false);
+            if (currentPage === 'settings') render();
+        }, wait);
+    }
+    async function listCloudBackups() {
+        const rows = await cloudDb('tutornote_backups?select=id,created_at,reason,ciphertext,iv,snapshot_sha256,app_version&order=created_at.desc&limit=50', { method: 'GET' });
+        return Array.isArray(rows) ? rows : [];
+    }
+    async function decryptCloudBackup(row) {
+        const key = await cloudMasterKey();
+        if (!key) throw new Error('Потрібно відновити ключ шифрування');
+        const plain = await decryptBytes(row.ciphertext, row.iv, key);
+        const text = new TextDecoder().decode(plain);
+        const hash = await sha256Hex(text);
+        if (row.snapshot_sha256 && row.snapshot_sha256 !== hash) throw new Error('Контрольна сума копії не збігається');
+        const parsed = JSON.parse(text);
+        if (!parsed || !Array.isArray(parsed.students) || !Array.isArray(parsed.lessons) || !Array.isArray(parsed.payments)) throw new Error('Некоректна структура резервної копії');
+        return parsed;
+    }
+    async function deleteCloudBackup(id) {
+        await cloudDb('tutornote_backups?id=eq.' + encodeURIComponent(id), { method: 'DELETE', headers: { 'Prefer': 'return=minimal' } });
+    }
+    function showCloudPanel() {
+        const cfg = getCloudConfig();
+        const session = getCloudSession();
+        const keyReady = !!localStorage.getItem(CLOUD_MASTER_KEY);
+        openModal('Зашифрована хмарна копія', `
+          <div class="note-box"><strong>End-to-end шифрування.</strong><br>Учні, нотатки, заняття та оплати шифруються AES‑256‑GCM на вашому iPhone до відправлення. У хмарі зберігається лише зашифрований текст.</div>
+          <div class="form-grid" style="margin-top:12px">
+            <div class="card" style="box-shadow:none"><strong>1. Хмарний проєкт</strong><div class="kicker" style="margin:5px 0 10px">${cfg && cfg.url ? escapeHTML(cfg.url) : 'Не налаштовано'}</div><button class="secondary-btn full" data-action="cloud-config">${cfg && cfg.url ? 'Змінити налаштування' : 'Налаштувати Supabase'}</button></div>
+            <div class="card" style="box-shadow:none"><strong>2. Обліковий запис</strong><div class="kicker" style="margin:5px 0 10px">${session && session.user && session.user.email ? escapeHTML(session.user.email) : 'Не виконано вхід'}</div><button class="secondary-btn full" data-action="cloud-auth">${session && session.access_token ? 'Увійти іншим акаунтом' : 'Увійти / зареєструватися'}</button></div>
+            <div class="card" style="box-shadow:none"><strong>3. Ключ шифрування</strong><div class="kicker" style="margin:5px 0 10px">${keyReady ? 'Ключ є на цьому пристрої' : 'Потрібна фраза відновлення'}</div><button class="secondary-btn full" data-action="cloud-key">${keyReady ? 'Перевірити / відновити ключ' : 'Налаштувати ключ'}</button></div>
+          </div>
+          <button class="primary-btn full" style="margin-top:12px" data-action="cloud-backup-now">Створити зашифровану копію зараз</button>
+          <button class="secondary-btn full" style="margin-top:8px" data-action="cloud-history">Хмарні резервні копії</button>
+          ${session && session.access_token ? '<button class="secondary-btn full" style="margin-top:8px" data-action="cloud-logout">Вийти з хмарного акаунта</button>' : ''}
+        `);
+    }
+    function showCloudConfigForm() {
+        const cfg = getCloudConfig() || {};
+        openModal('Supabase — підключення', `<form id="cloudConfigForm" class="form-grid">
+          <label>Project URL<input name="url" type="url" required placeholder="https://xxxx.supabase.co" value="${escapeHTML(cfg.url || '')}"></label>
+          <label>Publishable / anon key<textarea name="key" rows="4" required placeholder="sb_publishable_... або anon key">${escapeHTML(cfg.key || '')}</textarea></label>
+          <div class="note-box">Secret/service_role ключ сюди вставляти не можна. Для застосунку потрібен тільки publishable (або legacy anon) key.</div>
+          <button class="primary-btn" type="submit">Зберегти</button>
+        </form>`);
+    }
+    function showCloudAuthForm() {
+        openModal('Хмарний обліковий запис', `<form id="cloudAuthForm" class="form-grid">
+          <label>Дія<select name="mode"><option value="login">Увійти</option><option value="signup">Створити акаунт</option></select></label>
+          <label>Email<input name="email" type="email" autocomplete="email" required></label>
+          <label>Пароль<input name="password" type="password" autocomplete="current-password" minlength="8" required></label>
+          <button class="primary-btn" type="submit">Продовжити</button>
+        </form>`);
+    }
+    async function showCloudKeyForm() {
+        if (!(await ensureCloudSession())) { toast('Спочатку увійдіть у хмарний акаунт'); showCloudAuthForm(); return; }
+        let profile = null;
+        try { profile = await getCloudProfile(); } catch (e) { toast(e.message); return; }
+        const mode = profile ? 'recover' : 'create';
+        openModal(mode === 'create' ? 'Створити ключ шифрування' : 'Відновити ключ шифрування', `<form id="cloudKeyForm" data-mode="${mode}" class="form-grid">
+          <div class="note-box">${mode === 'create' ? 'Створіть окрему фразу відновлення. Вона НЕ надсилається в Supabase. Запишіть її в надійному місці: без неї розшифрувати копію після втрати телефона буде неможливо.' : 'Введіть ту саму фразу відновлення, яку ви створили під час першого налаштування.'}</div>
+          <label>Фраза відновлення<input name="passphrase" type="password" minlength="12" autocomplete="off" required></label>
+          ${mode === 'create' ? '<label>Повторіть фразу<input name="confirm" type="password" minlength="12" autocomplete="off" required></label>' : ''}
+          <button class="primary-btn" type="submit">${mode === 'create' ? 'Створити ключ' : 'Відновити ключ'}</button>
+        </form>`);
+    }
+    async function showCloudBackups() {
+        try {
+            if (!(await ensureCloudSession())) { toast('Потрібно увійти'); return; }
+            if (!(await cloudMasterKey())) { await showCloudKeyForm(); return; }
+            const rows = await listCloudBackups();
+            openModal('Хмарні резервні копії', rows.length ? `<div class="form-grid">${rows.map(r => `<div class="card" style="box-shadow:none"><strong>${new Intl.DateTimeFormat('uk-UA',{day:'2-digit',month:'2-digit',year:'2-digit',hour:'2-digit',minute:'2-digit'}).format(new Date(r.created_at))}</strong><div class="kicker" style="margin-top:5px">${escapeHTML(r.reason || 'Автокопія')} • AES‑256‑GCM</div><div class="inline-actions"><button class="secondary-btn" data-action="restore-cloud" data-id="${r.id}">Відновити</button><button class="danger-btn" data-action="delete-cloud" data-id="${r.id}">Стерти з хмари</button></div></div>`).join('')}</div>` : emptyState('☁','Хмарних копій ще немає','Створіть першу зашифровану копію.'));
+        } catch (e) { toast(e.message || 'Помилка хмари'); }
+    }
+    function simpleHash(text) {
+        let h = 2166136261;
+        for (let i = 0; i < text.length; i++) { h ^= text.charCodeAt(i); h = Math.imul(h, 16777619); }
+        return 'f' + (h >>> 0).toString(16);
+    }
+    async function hashPin(pin) {
+        const source = 'TutorNote-admin-v1:' + pin;
+        try {
+            if (window.crypto && crypto.subtle && window.TextEncoder) {
+                const data = new TextEncoder().encode(source);
+                const digest = await crypto.subtle.digest('SHA-256', data);
+                return Array.from(new Uint8Array(digest)).map(x => x.toString(16).padStart(2, '0')).join('');
+            }
+        } catch (e) { }
+        return simpleHash(source);
+    }
+    function getAdminConfig() {
+        try { return JSON.parse(localStorage.getItem(ADMIN_KEY) || 'null'); } catch (e) { return null; }
+    }
+    async function setupAdminPin() {
+        const pin = prompt('Створіть PIN адміністратора (4–8 цифр). Він буде потрібен для видалення даних.');
+        if (pin === null) return false;
+        if (!/^\d{4,8}$/.test(pin)) { toast('PIN має містити 4–8 цифр'); return false; }
+        const again = prompt('Повторіть PIN адміністратора');
+        if (again !== pin) { toast('PIN-коди не збігаються'); return false; }
+        const config = { enabled: true, hash: await hashPin(pin), createdAt: new Date().toISOString() };
+        localStorage.setItem(ADMIN_KEY, JSON.stringify(config));
+        toast('Захист адміністратора увімкнено');
+        render();
+        return true;
+    }
+    async function requireAdmin(label = 'цю дію') {
+        let config = getAdminConfig();
+        if (!config || !config.enabled || !config.hash) {
+            const ok = confirm('Для захисту від випадкового видалення спочатку потрібно створити PIN адміністратора. Створити зараз?');
+            if (!ok) return false;
+            if (!(await setupAdminPin())) return false;
+            config = getAdminConfig();
+        }
+        const pin = prompt('PIN адміністратора для дії: ' + label);
+        if (pin === null) return false;
+        if ((await hashPin(pin)) !== config.hash) { toast('Невірний PIN адміністратора'); return false; }
+        return true;
+    }
+    async function changeAdminPin() {
+        if (!(await requireAdmin('змінити PIN'))) return;
+        const pin = prompt('Новий PIN адміністратора (4–8 цифр)');
+        if (pin === null) return;
+        if (!/^\d{4,8}$/.test(pin)) { toast('PIN має містити 4–8 цифр'); return; }
+        const again = prompt('Повторіть новий PIN');
+        if (again !== pin) { toast('PIN-коди не збігаються'); return; }
+        localStorage.setItem(ADMIN_KEY, JSON.stringify({ enabled: true, hash: await hashPin(pin), createdAt: new Date().toISOString() }));
+        toast('PIN адміністратора змінено');
+        render();
+    }
+    function moveToTrash(type, id) {
+        let item = null;
+        if (type === 'lesson') {
+            item = lessonById(id);
+            if (item && item.autoRecurring && item.seriesOwnerType && item.seriesOwnerId && item.seriesSlotId && item.date) {
+                const key = `${item.seriesOwnerType}:${item.seriesOwnerId}:${item.seriesSlotId}:${item.date}`;
+                state.recurrenceExceptions = Array.isArray(state.recurrenceExceptions) ? state.recurrenceExceptions : [];
+                if (!state.recurrenceExceptions.includes(key)) state.recurrenceExceptions.push(key);
+            }
+            state.lessons = state.lessons.filter(x => x.id !== id);
+        }
+        if (type === 'student') {
+            item = studentById(id);
+            state.students = state.students.filter(x => x.id !== id);
+            state.lessons = state.lessons.filter(l => !(l.autoRecurring && l.studentId === id && l.date >= todayISO()));
+        }
+        if (type === 'group') {
+            item = groupById(id);
+            state.groups = state.groups.filter(x => x.id !== id);
+            state.lessons = state.lessons.filter(l => !(l.autoRecurring && l.groupId === id && l.date >= todayISO()));
+        }
+        if (type === 'payment') { item = paymentById(id); state.payments = state.payments.filter(x => x.id !== id); }
+        if (!item) return false;
+        state.trash.push({ id: uid('t'), type, data: item, deletedAt: new Date().toISOString() });
+        save('Переміщення в кошик');
+        return true;
+    }
+    function restoreTrashItem(trashId) {
+        const entry = state.trash.find(x => x.id === trashId);
+        if (!entry) return false;
+        if (entry.type === 'lesson' && !state.lessons.some(x => x.id === entry.data.id)) {
+            state.lessons.push(entry.data);
+            if (entry.data && entry.data.autoRecurring) {
+                const key = `${entry.data.seriesOwnerType}:${entry.data.seriesOwnerId}:${entry.data.seriesSlotId}:${entry.data.date}`;
+                state.recurrenceExceptions = (state.recurrenceExceptions || []).filter(x => x !== key);
+            }
+        }
+        if (entry.type === 'student' && !state.students.some(x => x.id === entry.data.id)) {
+            state.students.push(entry.data);
+            if (Array.isArray(entry.data.weeklySchedule) && entry.data.weeklySchedule.length) syncRecurringLessons('student', entry.data.id, entry.data.weeklySchedule, entry.data.scheduleStart || todayISO(), entry.data, false);
+        }
+        if (entry.type === 'group' && !state.groups.some(x => x.id === entry.data.id)) {
+            state.groups.push(entry.data);
+            if (Array.isArray(entry.data.weeklySchedule) && entry.data.weeklySchedule.length) syncRecurringLessons('group', entry.data.id, entry.data.weeklySchedule, entry.data.scheduleStart || todayISO(), entry.data, false);
+        }
+        if (entry.type === 'payment' && !state.payments.some(x => x.id === entry.data.id)) state.payments.push(entry.data);
+        state.trash = state.trash.filter(x => x.id !== trashId);
+        save('Відновлення з кошика');
+        return true;
+    }
+    function trashTitle(entry) {
+        if (entry.type === 'student') return (entry.data && entry.data.name) || 'Учень';
+        if (entry.type === 'group') return 'Група — ' + ((entry.data && entry.data.name) || 'Без назви');
+        if (entry.type === 'lesson') {
+            const owner = lessonOwner(entry.data || {});
+            return 'Заняття' + (owner && owner.name ? ' — ' + owner.name : '') + (entry.data && entry.data.date ? ' • ' + entry.data.date : '');
+        }
+        if (entry.type === 'payment') {
+            const s = studentById(entry.data && entry.data.studentId);
+            const g = groupById(entry.data && entry.data.groupId);
+            return 'Оплата' + (s ? ' — ' + s.name : (g ? ' — ' + g.name : '')) + (entry.data && entry.data.amount ? ' • ' + money(entry.data.amount) : '');
+        }
+        return 'Запис';
+    }
+    async function showTrash() {
+        const items = [...state.trash].sort((a, b) => String(b.deletedAt).localeCompare(String(a.deletedAt)));
+        openModal('Кошик', items.length ? `<div class="form-grid">${items.map(x => `<div class="card" style="box-shadow:none"><strong>${escapeHTML(trashTitle(x))}</strong><div class="kicker" style="margin-top:5px">Видалено ${new Intl.DateTimeFormat('uk-UA', { day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit' }).format(new Date(x.deletedAt))}</div><div class="inline-actions"><button class="secondary-btn" data-action="restore-trash" data-id="${x.id}">Відновити</button><button class="danger-btn" data-action="purge-trash" data-id="${x.id}">Стерти назавжди</button></div></div>`).join('')}</div><button class="danger-btn full" style="margin-top:12px" data-action="empty-trash">Очистити кошик назавжди</button>` : emptyState('♲','Кошик порожній','Тут з’являтимуться видалені записи.'));
+    }
+    async function showBackups() {
+        const backups = await getBackups();
+        openModal('Автоматичні копії', backups.length ? `<div class="form-grid">${backups.slice(0, 20).map(b => { const snap=b.snapshot||{}; return `<div class="card" style="box-shadow:none"><strong>${new Intl.DateTimeFormat('uk-UA',{day:'2-digit',month:'2-digit',year:'2-digit',hour:'2-digit',minute:'2-digit'}).format(new Date(b.createdAt))}</strong><div class="kicker" style="margin-top:5px">${escapeHTML(b.reason || 'Автокопія')} • ${(snap.students||[]).length} уч. • ${(snap.groups||[]).length} груп • ${(snap.lessons||[]).length} зан. • ${(snap.payments||[]).length} оплат • ${(snap.packages||[]).length} абон.</div><button class="secondary-btn" data-action="restore-backup" data-id="${b.id}">Відновити цю копію</button></div>`; }).join('')}</div>` : emptyState('↻','Автокопій ще немає','Після першої зміни TutorNote створить копію автоматично.'));
+    }
+    function toast(message) {
+        const el = $('#toast');
+        el.textContent = message;
+        el.classList.add('show');
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => el.classList.remove('show'), 2400);
+    }
+    function studentById(id) { return state.students.find(s => s.id === id); }
+    function lessonById(id) { return state.lessons.find(x => x.id === id); }
+    function paymentById(id) { return state.payments.find(x => x.id === id); }
+
+    function groupById(id) { return state.groups.find(g => g.id === id); }
+    const LESSON_STATUSES = [
+        { value: 'planned', label: 'Заплановано' },
+        { value: 'done', label: 'Проведено' },
+        { value: 'cancelled_student', label: 'Скасовано учнем' },
+        { value: 'cancelled_teacher', label: 'Скасовано викладачем' },
+        { value: 'moved', label: 'Перенесено' },
+        { value: 'no_show', label: 'Не прийшов' }
+    ];
+    function statusLabel(status) {
+        const normalized = status === 'cancelled' ? 'cancelled_student' : (status || 'planned');
+        const item = LESSON_STATUSES.find(x => x.value === normalized);
+        return item ? item.label : normalized;
+    }
+    function statusClass(status) {
+        const normalized = status === 'cancelled' ? 'cancelled_student' : (status || 'planned');
+        if (normalized === 'done') return 'done';
+        if (normalized === 'planned') return 'planned';
+        if (normalized === 'no_show') return 'no-show';
+        if (normalized === 'moved') return 'moved';
+        return 'cancelled';
+    }
+    function isCancelledLike(status) {
+        return ['cancelled', 'cancelled_student', 'cancelled_teacher', 'moved'].includes(status);
+    }
+    function blocksCalendar(status) {
+        return !['cancelled', 'cancelled_student', 'cancelled_teacher', 'moved', 'no_show'].includes(status);
+    }
+    function countsAsScheduled(status) {
+        return ['planned', 'done'].includes(status || 'planned');
+    }
+    function packageById(id) { return (state.packages || []).find(x => x.id === id); }
+    function packagesForStudent(id) {
+        return (state.packages || []).filter(x => x.studentId === id).sort((a,b) => String(b.purchasedAt || '').localeCompare(String(a.purchasedAt || '')));
+    }
+    function packageUsedCount(packageId) {
+        return state.lessons.filter(l => l.status === 'done' && l.billing && l.billing.type === 'package' && l.billing.packageId === packageId).length;
+    }
+    function packageRemaining(pkg) {
+        return Math.max(0, Number(pkg.lessonsTotal || 0) - packageUsedCount(pkg.id));
+    }
+    function packageUnitPrice(pkg) {
+        const total = Number(pkg.totalPrice || 0), count = Number(pkg.lessonsTotal || 0);
+        return count > 0 ? total / count : 0;
+    }
+    function activePackageForStudent(studentId, lessonDate = todayISO()) {
+        return packagesForStudent(studentId)
+            .filter(p => p.active !== false && (!p.purchasedAt || p.purchasedAt <= lessonDate) && packageRemaining(p) > 0)
+            .sort((a,b) => String(a.purchasedAt || '').localeCompare(String(b.purchasedAt || '')))[0] || null;
+    }
+    function groupPaymentMode(g) { return (g && g.priceMode) === 'total' ? 'total' : 'per_student'; }
+    function groupExpectedPrice(g) {
+        if (!g) return 0;
+        const rate = Number(g.rate || 0);
+        return groupPaymentMode(g) === 'per_student' ? rate * Number((g.studentIds || []).length || 0) : rate;
+    }
+    function lessonExpectedRevenue(l) {
+        if (!l) return 0;
+        if (l.groupId) {
+            const g = groupById(l.groupId);
+            const mode = l.groupPriceMode || groupPaymentMode(g);
+            const rate = Number(l.groupRate != null ? l.groupRate : (g && g.rate) || 0);
+            const count = Number(l.groupMemberCount != null ? l.groupMemberCount : ((g && g.studentIds) || []).length || 0);
+            return mode === 'per_student' ? rate * count : Number(l.price != null ? l.price : rate);
+        }
+        return Number(l.price || 0);
+    }
+    function lessonStudentCharge(l, studentId) {
+        if (!l || l.status !== 'done') return 0;
+        if (l.studentId === studentId) {
+            if (l.billing && Number.isFinite(Number(l.billing.amount))) return Number(l.billing.amount || 0);
+            return Number(l.price || 0);
+        }
+        if (l.groupId) {
+            const g = groupById(l.groupId);
+            const members = Array.isArray(l.groupStudentIds) ? l.groupStudentIds : ((g && g.studentIds) || []);
+            if (!g || !members.includes(studentId)) return 0;
+            const mode = l.groupPriceMode || groupPaymentMode(g);
+            if (mode !== 'per_student') return 0;
+            return Number(l.groupRate != null ? l.groupRate : g.rate || 0);
+        }
+        return 0;
+    }
+    function studentPaymentsTotal(studentId) {
+        return state.payments.filter(p => p.studentId === studentId).reduce((a,p) => a + Number(p.amount || 0), 0);
+    }
+    function studentChargesTotal(studentId) {
+        return state.lessons.reduce((a,l) => a + lessonStudentCharge(l, studentId), 0);
+    }
+    function studentBalance(studentId) { return studentPaymentsTotal(studentId) - studentChargesTotal(studentId); }
+    function groupPaymentsTotal(groupId) {
+        return state.payments.filter(p => p.groupId === groupId).reduce((a,p) => a + Number(p.amount || 0), 0);
+    }
+    function groupChargesTotal(groupId) {
+        const g = groupById(groupId);
+        if (!g || groupPaymentMode(g) !== 'total') return 0;
+        return state.lessons.filter(l => l.groupId === groupId && l.status === 'done').reduce((a,l) => a + Number(l.price != null ? l.price : g.rate || 0), 0);
+    }
+    function groupBalance(groupId) { return groupPaymentsTotal(groupId) - groupChargesTotal(groupId); }
+    function formatBalance(value) {
+        const n = Number(value || 0);
+        if (n > 0) return `+${money(n)}`;
+        return money(n);
+    }
+    function reconcileLessonBilling(lesson) {
+        if (!lesson) return;
+        if (lesson.status !== 'done') {
+            if (lesson.billing) delete lesson.billing;
+            return;
+        }
+        if (lesson.studentId) {
+            const existingPackage = lesson.billing && lesson.billing.type === 'package' ? packageById(lesson.billing.packageId) : null;
+            if (existingPackage && existingPackage.studentId === lesson.studentId) {
+                lesson.billing.amount = packageUnitPrice(existingPackage);
+                lesson.paid = true;
+                return;
+            }
+            const pkg = activePackageForStudent(lesson.studentId, lesson.date);
+            if (pkg) {
+                lesson.billing = { type: 'package', packageId: pkg.id, amount: packageUnitPrice(pkg) };
+                lesson.paid = true;
+            } else {
+                lesson.billing = { type: 'balance', amount: Number(lesson.price || 0) };
+                lesson.paid = studentBalance(lesson.studentId) >= 0;
+            }
+            return;
+        }
+        if (lesson.groupId) {
+            const g = groupById(lesson.groupId);
+            if (g) lesson.billing = { type: groupPaymentMode(g) === 'per_student' ? 'group_per_student' : 'group_total', amount: lessonExpectedRevenue(lesson) };
+        }
+    }
+    function refreshFutureSeriesPricing(ownerType, ownerId, profile) {
+        state.lessons.forEach(l => {
+            if (!l.autoRecurring || l.seriesOwnerType !== ownerType || l.seriesOwnerId !== ownerId || l.date < todayISO()) return;
+            l.subject = profile.subject || l.subject || '';
+            if (ownerType === 'group') {
+                l.groupPriceMode = groupPaymentMode(profile);
+                l.groupRate = Number(profile.rate || 0);
+                l.groupMemberCount = Number((profile.studentIds || []).length || 0);
+                l.groupStudentIds = [...(profile.studentIds || [])];
+                l.price = groupExpectedPrice(profile);
+            } else {
+                l.price = Number(profile.rate || 0);
+            }
+        });
+    }
+    function scheduleChanged(oldSlots, newSlots, oldStart, newStart) {
+        const normalize = list => (Array.isArray(list) ? list : []).map(x => ({ id:String(x.id || ''), day:Number(x.day), time:String(x.time || ''), duration:Number(x.duration || 60) })).sort((a,b)=>a.id.localeCompare(b.id));
+        return JSON.stringify(normalize(oldSlots)) !== JSON.stringify(normalize(newSlots)) || String(oldStart || '') !== String(newStart || '');
+    }
+    function addRecurrenceException(lesson) {
+        if (!lesson || !lesson.seriesOwnerType || !lesson.seriesOwnerId || !lesson.seriesSlotId || !lesson.date) return;
+        const key = `${lesson.seriesOwnerType}:${lesson.seriesOwnerId}:${lesson.seriesSlotId}:${lesson.date}`;
+        state.recurrenceExceptions = Array.isArray(state.recurrenceExceptions) ? state.recurrenceExceptions : [];
+        if (!state.recurrenceExceptions.includes(key)) state.recurrenceExceptions.push(key);
+    }
+    function applyNextOnlyScheduleChange(ownerType, owner, oldSlots, newSlots) {
+        const oldMap = new Map((oldSlots || []).map(x => [String(x.id), x]));
+        const newMap = new Map((newSlots || []).map(x => [String(x.id), x]));
+        let changed = 0, skipped = 0;
+        const futureForSlot = slotId => state.lessons.filter(l => l.autoRecurring && l.seriesOwnerType === ownerType && l.seriesOwnerId === owner.id && l.seriesSlotId === slotId && l.date >= todayISO() && !isCancelledLike(l.status)).sort((a,b)=>`${a.date} ${a.time}`.localeCompare(`${b.date} ${b.time}`))[0];
+        newMap.forEach((slot, id) => {
+            const old = oldMap.get(id);
+            if (old && Number(old.day) === Number(slot.day) && old.time === slot.time && Number(old.duration || 60) === Number(slot.duration || 60)) return;
+            const existing = old ? futureForSlot(id) : null;
+            if (existing) {
+                const originalDate = existing.date;
+                addRecurrenceException(existing);
+                const d = nextOccurrence(originalDate, slot.day);
+                const candidate = Object.assign({}, existing, { date: isoFromDate(d), time: slot.time, duration: Number(slot.duration || 60), autoRecurring: false, scheduleOverride: true, status: 'planned' });
+                if (hasConflict(candidate, existing.id)) { skipped++; return; }
+                Object.assign(existing, candidate);
+                changed++;
+            } else if (!old) {
+                const d = nextOccurrence(todayISO(), slot.day);
+                const candidate = {
+                    id: uid('l'), studentId: ownerType === 'student' ? owner.id : '', groupId: ownerType === 'group' ? owner.id : '',
+                    date: isoFromDate(d), time: slot.time, duration: Number(slot.duration || 60), subject: owner.subject || '',
+                    price: ownerType === 'group' ? groupExpectedPrice(owner) : Number(owner.rate || 0), status: 'planned', paid: false, notes: '',
+                    autoRecurring: false, scheduleOverride: true,
+                    groupPriceMode: ownerType === 'group' ? groupPaymentMode(owner) : undefined,
+                    groupRate: ownerType === 'group' ? Number(owner.rate || 0) : undefined,
+                    groupMemberCount: ownerType === 'group' ? Number((owner.studentIds || []).length || 0) : undefined,
+                    groupStudentIds: ownerType === 'group' ? [...(owner.studentIds || [])] : undefined
+                };
+                if (hasConflict(candidate)) skipped++; else { state.lessons.push(candidate); changed++; }
+            }
+        });
+        oldMap.forEach((slot, id) => {
+            if (newMap.has(id)) return;
+            const existing = futureForSlot(id);
+            if (existing) {
+                addRecurrenceException(existing);
+                existing.autoRecurring = false;
+                existing.scheduleOverride = true;
+                existing.status = 'cancelled_teacher';
+                changed++;
+            }
+        });
+        return { changed, skipped };
+    }
+    function periodLabelWeek(iso) {
+        const monday = startOfWeek(iso);
+        const sunday = new Date(monday); sunday.setDate(monday.getDate() + 6);
+        const sameMonth = monday.getMonth() === sunday.getMonth();
+        const left = new Intl.DateTimeFormat('uk-UA', { day:'numeric', month: sameMonth ? undefined : 'short' }).format(monday);
+        const right = new Intl.DateTimeFormat('uk-UA', { day:'numeric', month:'short', year: monday.getFullYear() !== sunday.getFullYear() ? 'numeric' : undefined }).format(sunday);
+        return `${left} — ${right}`;
+    }
+    const WEEKDAYS = [
+        { value: 1, label: 'Понеділок', short: 'Пн' },
+        { value: 2, label: 'Вівторок', short: 'Вт' },
+        { value: 3, label: 'Середа', short: 'Ср' },
+        { value: 4, label: 'Четвер', short: 'Чт' },
+        { value: 5, label: 'П’ятниця', short: 'Пт' },
+        { value: 6, label: 'Субота', short: 'Сб' },
+        { value: 7, label: 'Неділя', short: 'Нд' }
+    ];
+    function weekdayLabel(day, short = false) {
+        const item = WEEKDAYS.find(x => x.value === Number(day));
+        return item ? (short ? item.short : item.label) : '';
+    }
+    function lessonOwner(l) {
+        if (l && l.groupId) {
+            const g = groupById(l.groupId);
+            return { type: 'group', id: l.groupId, entity: g, name: g ? g.name : 'Група видалена', subject: (l && l.subject) || (g && g.subject) || 'Групове заняття', rate: (g && g.rate) || 0 };
+        }
+        const s = studentById(l && l.studentId);
+        return { type: 'student', id: l && l.studentId, entity: s, name: s ? s.name : 'Учень видалений', subject: (l && l.subject) || (s && s.subject) || 'Заняття', rate: (s && s.rate) || 0 };
+    }
+    function ownerFromValue(value) {
+        const raw = String(value || '');
+        const idx = raw.indexOf(':');
+        if (idx < 0) return null;
+        const type = raw.slice(0, idx);
+        const id = raw.slice(idx + 1);
+        if (type === 'group') {
+            const g = groupById(id);
+            return g ? { type, id, entity: g, name: g.name, subject: g.subject || '', rate: g.rate || 0 } : null;
+        }
+        const s = studentById(id);
+        return s ? { type: 'student', id, entity: s, name: s.name, subject: s.subject || '', rate: s.rate || 0 } : null;
+    }
+    function scheduleSlotRow(slot = {}) {
+        const id = slot.id || uid('slot');
+        const day = Number(slot.day || 1);
+        const time = slot.time || '16:00';
+        const duration = Number(slot.duration || 60);
+        return `<div class="schedule-row" data-slot-id="${escapeHTML(id)}">
+          <div class="schedule-fields">
+            <div class="field"><label>День</label><select name="scheduleDay">${WEEKDAYS.map(d => `<option value="${d.value}" ${d.value === day ? 'selected' : ''}>${d.label}</option>`).join('')}</select></div>
+            <div class="field"><label>Час</label><input type="time" name="scheduleTime" value="${escapeHTML(time)}" required></div>
+            <div class="field"><label>Хв</label><input type="number" name="scheduleDuration" min="15" step="5" value="${duration}" required></div>
+          </div>
+          <button type="button" class="remove-slot" data-action="remove-schedule-row" aria-label="Прибрати час">×</button>
+        </div>`;
+    }
+    function scheduleEditorHTML(slots = [], startDate = '') {
+        const rows = Array.isArray(slots) ? slots : [];
+        return `<div class="schedule-editor">
+          <div class="schedule-head"><div><strong>Регулярний розклад</strong><small>Заняття автоматично з’являтимуться в загальному календарі.</small></div><button type="button" class="secondary-btn compact" data-action="add-schedule-row">＋ Час</button></div>
+          <div class="field"><label>Починаючи з</label><input type="date" name="scheduleStart" value="${escapeHTML(startDate || todayISO())}"></div>
+          <div class="schedule-list">${rows.map(scheduleSlotRow).join('')}</div>
+          ${rows.length ? '' : '<div class="schedule-empty">Розклад не задано. Натисніть «＋ Час», щоб додати регулярне заняття.</div>'}
+        </div>`;
+    }
+    function collectSchedule(form) {
+        return [...form.querySelectorAll('.schedule-row')].map(row => ({
+            id: row.dataset.slotId || uid('slot'),
+            day: Number($('select[name="scheduleDay"]', row).value),
+            time: $('input[name="scheduleTime"]', row).value,
+            duration: Number($('input[name="scheduleDuration"]', row).value || 60)
+        })).filter(x => x.day && x.time && x.duration);
+    }
+    function nextOccurrence(startIso, weekday) {
+        const d = new Date(`${startIso}T12:00:00`);
+        const current = d.getDay() || 7;
+        const delta = (Number(weekday) - current + 7) % 7;
+        d.setDate(d.getDate() + delta);
+        return d;
+    }
+    function recurringLessonExists(ownerType, ownerId, slotId, date) {
+        const key = `${ownerType}:${ownerId}:${slotId}:${date}`;
+        if ((state.recurrenceExceptions || []).includes(key)) return true;
+        return state.lessons.some(l => l.autoRecurring && l.seriesOwnerType === ownerType && l.seriesOwnerId === ownerId && l.seriesSlotId === slotId && l.date === date);
+    }
+    function syncRecurringLessons(ownerType, ownerId, slots, startDate, profile, replaceFuture = true) {
+        const today = todayISO();
+        if (replaceFuture) {
+            state.lessons = state.lessons.filter(l => !(l.autoRecurring && l.seriesOwnerType === ownerType && l.seriesOwnerId === ownerId && l.date >= today));
+        }
+        const normalized = Array.isArray(slots) ? slots : [];
+        const start = (startDate && startDate > today) ? startDate : today;
+        const horizon = new Date(`${today}T12:00:00`);
+        horizon.setDate(horizon.getDate() + 183);
+        let created = 0, skipped = 0;
+        normalized.forEach(slot => {
+            let d = nextOccurrence(start, slot.day);
+            while (d <= horizon) {
+                const date = isoFromDate(d);
+                if (!recurringLessonExists(ownerType, ownerId, slot.id, date)) {
+                    const candidate = {
+                        id: uid('l'),
+                        studentId: ownerType === 'student' ? ownerId : '',
+                        groupId: ownerType === 'group' ? ownerId : '',
+                        date,
+                        time: slot.time,
+                        duration: Number(slot.duration || 60),
+                        subject: (profile && profile.subject) || '',
+                        price: ownerType === 'group' ? groupExpectedPrice(profile) : Number((profile && profile.rate) || 0),
+                        status: 'planned',
+                        paid: false,
+                        notes: '',
+                        autoRecurring: true,
+                        seriesOwnerType: ownerType,
+                        seriesOwnerId: ownerId,
+                        seriesSlotId: slot.id,
+                        groupPriceMode: ownerType === 'group' ? groupPaymentMode(profile) : undefined,
+                        groupRate: ownerType === 'group' ? Number((profile && profile.rate) || 0) : undefined,
+                        groupMemberCount: ownerType === 'group' ? Number(((profile && profile.studentIds) || []).length || 0) : undefined,
+                        groupStudentIds: ownerType === 'group' ? [...((profile && profile.studentIds) || [])] : undefined
+                    };
+                    if (!hasConflict(candidate)) {
+                        state.lessons.push(candidate);
+                        created++;
+                    } else {
+                        skipped++;
+                    }
+                }
+                d = new Date(d);
+                d.setDate(d.getDate() + 7);
+            }
+        });
+        return { created, skipped };
+    }
+    function ensureRecurringHorizon() {
+        let created = 0;
+        state.students.forEach(s => {
+            if (Array.isArray(s.weeklySchedule) && s.weeklySchedule.length) created += syncRecurringLessons('student', s.id, s.weeklySchedule, s.scheduleStart || todayISO(), s, false).created;
+        });
+        state.groups.forEach(g => {
+            if (Array.isArray(g.weeklySchedule) && g.weeklySchedule.length) created += syncRecurringLessons('group', g.id, g.weeklySchedule, g.scheduleStart || todayISO(), g, false).created;
+        });
+        return created;
+    }
+    function scheduleSummary(slots) {
+        const list = Array.isArray(slots) ? slots : [];
+        if (!list.length) return 'Розклад не задано';
+        return list.map(x => `${weekdayLabel(x.day, true)} ${x.time} · ${x.duration || 60} хв`).join(' • ');
+    }
+    function lessonsForGroup(id) {
+        return state.lessons.filter(l => l.groupId === id).sort((a, b) => `${b.date} ${b.time}`.localeCompare(`${a.date} ${a.time}`));
+    }
+    function openModal(title, html) {
+        modalTitle.textContent = title;
+        modalBody.innerHTML = html;
+        modalBackdrop.classList.remove('hidden');
+        setTimeout(() => { var _a; return (_a = modalBody.querySelector('input,select,textarea')) === null || _a === void 0 ? void 0 : _a.focus(); }, 30);
+    }
+    function closeModal() { modalBackdrop.classList.add('hidden'); modalBody.innerHTML = ''; }
+    function emptyState(icon, title, text, action = '', actionLabel = 'Додати') {
+        return `<div class="empty"><div class="empty-icon">${icon}</div><strong>${escapeHTML(title)}</strong><div>${escapeHTML(text)}</div>${action ? `<button class="secondary-btn" style="margin-top:12px" data-action="${action}">${escapeHTML(actionLabel)}</button>` : ''}</div>`;
+    }
+    function formatLongDate(iso) {
+        return capitalize(new Intl.DateTimeFormat('uk-UA', { weekday: 'long', day: 'numeric', month: 'long' }).format(new Date(`${iso}T12:00:00`)));
+    }
+    function startOfWeek(iso) {
+        const d = new Date(`${iso}T12:00:00`);
+        const day = d.getDay() || 7;
+        d.setDate(d.getDate() - day + 1);
+        return d;
+    }
+    function isoFromDate(d) { return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; }
+    function lessonsForDate(iso) {
+        return state.lessons.filter(l => l.date === iso).sort((a, b) => a.time.localeCompare(b.time));
+    }
+    function paymentsForStudent(id) { return state.payments.filter(p => p.studentId === id); }
+    function lessonsForStudent(id) {
+        const groupIds = state.groups.filter(g => Array.isArray(g.studentIds) && g.studentIds.includes(id)).map(g => g.id);
+        return state.lessons.filter(l => l.studentId === id || (l.groupId && groupIds.includes(l.groupId))).sort((a, b) => `${b.date} ${b.time}`.localeCompare(`${a.date} ${a.time}`));
+    }
+    function monthKey(iso) { return String(iso).slice(0, 7); }
+    function thisMonthKey() { return todayISO().slice(0, 7); }
+    function renderHeader() {
+        $('#todayLabel').textContent = capitalize(new Intl.DateTimeFormat('uk-UA', { weekday: 'long', day: 'numeric', month: 'long' }).format(new Date()));
+        const titles = { home: state.tutor.name || 'TutorNote', schedule: 'Розклад', students: 'Учні та групи', payments: 'Оплати', settings: 'Налаштування' };
+        pageTitle.textContent = titles[currentPage] || 'TutorNote';
+        $$('.nav-item').forEach(b => b.classList.toggle('active', b.dataset.page === currentPage));
+        document.body.classList.toggle('dark', !!state.tutor.dark);
+        fab.style.display = currentPage === 'settings' ? 'none' : 'block';
+    }
+    function renderHome() {
+        const today = todayISO();
+        const todayLessons = lessonsForDate(today).filter(l => countsAsScheduled(l.status));
+        const todayMinutes = todayLessons.reduce((a,l) => a + Number(l.duration || 60), 0);
+        const expectedToday = todayLessons.reduce((a,l) => a + lessonExpectedRevenue(l), 0);
+        const monthPayments = state.payments.filter(p => monthKey(p.date) === thisMonthKey()).reduce((a,p) => a + Number(p.amount || 0), 0);
+        const unpaidLessons = state.lessons.filter(l => l.status === 'done' && !l.paid && !(l.billing && l.billing.type === 'package')).length;
+        const debtStudents = state.students.filter(x => studentBalance(x.id) < 0).length;
+        const lowPackages = (state.packages || []).filter(pkg => pkg.active !== false && packageRemaining(pkg) > 0 && packageRemaining(pkg) <= 2).length;
+        const upcoming = state.lessons.filter(l => l.status === 'planned' && `${l.date} ${l.time}` >= `${today} 00:00`).sort((a,b)=>`${a.date} ${a.time}`.localeCompare(`${b.date} ${b.time}`)).slice(0,5);
+        const h = Math.floor(todayMinutes / 60), m = todayMinutes % 60;
+        const durationText = `${h ? h + ' год' : ''}${h && m ? ' ' : ''}${m ? m + ' хв' : (!h ? '0 хв' : '')}`;
+        app.innerHTML = `
+      <section class="section hero">
+        <div class="hero-top"><div><div class="label">Сьогодні</div><div class="big-number">${todayLessons.length} занять</div></div><div class="pill">${durationText}</div></div>
+        <div class="hero-grid">
+          <div class="hero-stat"><small>Очікуваний дохід</small><strong>${money(expectedToday)}</strong></div>
+          <div class="hero-stat"><small>Надійшло за місяць</small><strong>${money(monthPayments)}</strong></div>
+          <div class="hero-stat"><small>Учні / групи</small><strong>${state.students.length} / ${state.groups.length}</strong></div>
+        </div>
+      </section>
+      <section class="section dashboard-grid">
+        <div class="card metric-card"><div class="metric-icon">₴</div><strong>${unpaidLessons}</strong><small>неоплачених проведених</small></div>
+        <div class="card metric-card"><div class="metric-icon">!</div><strong>${debtStudents}</strong><small>учнів мають борг</small></div>
+        <div class="card metric-card"><div class="metric-icon">◎</div><strong>${lowPackages}</strong><small>абонементів закінчуються</small></div>
+      </section>
+      <section class="section">
+        <div class="section-head"><h2>Найближчі заняття</h2><button data-go="schedule">Весь розклад</button></div>
+        <div class="lesson-list">${upcoming.length ? upcoming.map(lessonRow).join('') : emptyState('▦','Розклад порожній','Додайте перше заняття — воно з’явиться тут.','add-lesson','Додати заняття')}</div>
+      </section>`;
+    }
+    function lessonRow(l) {
+        const owner = lessonOwner(l);
+        const cls = statusClass(l.status);
+        const paymentText = l.status === 'done' ? ((l.billing && l.billing.type === 'package') ? 'абонемент' : (l.paid ? 'оплачено' : 'не оплачено')) : statusLabel(l.status).toLowerCase();
+        const badgeClass = l.status === 'done' ? ((l.billing && l.billing.type === 'package') || l.paid ? 'paid' : 'unpaid') : cls;
+        return `<div class="lesson" data-lesson-id="${l.id}">
+      <div class="lesson-time">${escapeHTML(l.time)}<small style="display:block;color:var(--muted);margin-top:3px;font-weight:700">${localeDate(l.date,{day:'2-digit',month:'2-digit'})}</small></div>
+      <div class="status-dot ${cls}"></div>
+      <div class="lesson-main"><strong>${owner.type === 'group' ? '👥 ' : ''}${escapeHTML(owner.name)}</strong><small>${escapeHTML(owner.subject)} • ${l.duration || 60} хв${l.autoRecurring ? ' • регулярно' : ''}${l.status === 'moved' && l.movedToDate ? ` • → ${localeDate(l.movedToDate)} ${escapeHTML(l.movedToTime || '')}` : ''}</small></div>
+      <span class="badge ${badgeClass}">${escapeHTML(paymentText)}</span><span class="chev">›</span>
+    </div>`;
+    }
+    function renderSchedule() {
+        const renderTimeline = iso => {
+            const dayLessons = lessonsForDate(iso);
+            let rows = '';
+            for (let h = 8; h <= 21; h++) {
+                const events = dayLessons.filter(l => Number(l.time.slice(0,2)) === h);
+                rows += `<div class="timeline-row"><div class="timeline-hour">${pad(h)}:00</div><div class="timeline-events">${events.map(l => { const owner=lessonOwner(l); return `<div class="event-chip ${statusClass(l.status)} ${owner.type==='group'?'group-event':''}" data-lesson-id="${l.id}"><strong>${escapeHTML(l.time)} · ${owner.type==='group'?'👥 ':''}${escapeHTML(owner.name)}</strong>${escapeHTML(owner.subject)} · ${l.duration||60} хв · ${escapeHTML(statusLabel(l.status))}${l.autoRecurring?' · регулярно':''}</div>`; }).join('')}</div></div>`;
+            }
+            return { dayLessons, rows };
+        };
+        const shiftLabel = calendarView === 'day' ? formatLongDate(selectedDate) : calendarView === 'month' ? capitalize(new Intl.DateTimeFormat('uk-UA',{month:'long',year:'numeric'}).format(new Date(`${selectedDate}T12:00:00`))) : periodLabelWeek(selectedDate);
+        let body = '';
+        if (calendarView === 'week') {
+            const monday = startOfWeek(selectedDate);
+            const dayNames=['Пн','Вт','Ср','Чт','Пт','Сб','Нд'];
+            const days=Array.from({length:7},(_,i)=>{const d=new Date(monday);d.setDate(monday.getDate()+i);return d;});
+            const timeline=renderTimeline(selectedDate);
+            body = `<div class="week-strip">${days.map((d,i)=>{const iso=isoFromDate(d);const count=lessonsForDate(iso).filter(l=>!isCancelledLike(l.status)).length;return `<button class="day-chip ${iso===selectedDate?'active':''} ${iso===todayISO()?'today':''}" data-date="${iso}"><small>${dayNames[i]}</small><strong>${d.getDate()}</strong>${count?`<em>${count}</em>`:''}</button>`;}).join('')}</div>${timeline.dayLessons.length===0?`<div style="margin-bottom:10px">${emptyState('＋','Вільний день','На цю дату ще немає занять.','add-lesson','Запланувати')}</div>`:''}<div class="timeline">${timeline.rows}</div>`;
+        } else if (calendarView === 'day') {
+            const timeline=renderTimeline(selectedDate);
+            body = `${timeline.dayLessons.length===0?`<div style="margin-bottom:10px">${emptyState('＋','Вільний день','На цю дату ще немає занять.','add-lesson','Запланувати')}</div>`:''}<div class="timeline">${timeline.rows}</div>`;
+        } else {
+            const selected = new Date(`${selectedDate}T12:00:00`);
+            const first = new Date(selected.getFullYear(), selected.getMonth(), 1, 12);
+            const gridStart = new Date(first); const dow=gridStart.getDay()||7; gridStart.setDate(gridStart.getDate()-dow+1);
+            const cells=Array.from({length:42},(_,i)=>{const d=new Date(gridStart);d.setDate(gridStart.getDate()+i);return d;});
+            const chosen=lessonsForDate(selectedDate);
+            body = `<div class="month-weekdays">${['Пн','Вт','Ср','Чт','Пт','Сб','Нд'].map(x=>`<span>${x}</span>`).join('')}</div><div class="month-grid">${cells.map(d=>{const iso=isoFromDate(d);const ls=lessonsForDate(iso).filter(l=>!isCancelledLike(l.status));const outside=d.getMonth()!==selected.getMonth();return `<button class="month-day ${outside?'outside':''} ${iso===selectedDate?'selected':''} ${iso===todayISO()?'today':''}" data-date="${iso}"><strong>${d.getDate()}</strong>${ls.length?`<span>${ls.length}</span>`:''}</button>`;}).join('')}</div><div class="section-head month-picked"><h2>${formatLongDate(selectedDate)}</h2><button data-action="calendar-day">Відкрити день</button></div><div class="lesson-list">${chosen.length?chosen.map(lessonRow).join(''):emptyState('▦','Немає занять','Оберіть іншу дату або додайте заняття.')}</div>`;
+        }
+        app.innerHTML = `<section class="section">
+          <div class="calendar-view segmented"><button data-action="set-calendar-view" data-view="day" class="${calendarView==='day'?'active':''}">День</button><button data-action="set-calendar-view" data-view="week" class="${calendarView==='week'?'active':''}">Тиждень</button><button data-action="set-calendar-view" data-view="month" class="${calendarView==='month'?'active':''}">Місяць</button></div>
+          <div class="calendar-nav"><button class="nav-arrow" data-action="prev-period" aria-label="Назад">‹</button><div><strong>${escapeHTML(shiftLabel)}</strong><small>${calendarView==='week'?'Перемикайте тижні стрілками':calendarView==='month'?'Огляд завантаженості':'Денний таймлайн'}</small></div><button class="nav-arrow" data-action="next-period" aria-label="Вперед">›</button></div>
+          <div class="calendar-today"><button class="secondary-btn compact" data-action="today">Сьогодні</button></div>
+          ${body}
+        </section>`;
+    }
+    function renderStudents(query = '') {
+        const q = query.trim().toLowerCase();
+        if (peopleView === 'groups') {
+            const groups = state.groups.filter(g => {
+                const memberNames = (g.studentIds || []).map(id => (studentById(id) || {}).name || '').join(' ');
+                return !q || `${g.name} ${g.subject || ''} ${memberNames}`.toLowerCase().includes(q);
+            }).sort((a, b) => a.name.localeCompare(b.name, 'uk'));
+            app.innerHTML = `
+      <section class="section">
+        <div class="segmented people-tabs"><button data-people-view="students">Учні (${state.students.length})</button><button class="active" data-people-view="groups">Групи (${state.groups.length})</button></div>
+        <div class="toolbar"><input id="studentSearch" class="search" placeholder="Пошук групи" value="${escapeHTML(query)}"><button class="primary-btn" data-action="add-group">＋</button></div>
+        <div class="student-list">
+          ${groups.length ? groups.map(g => {
+              const next = state.lessons.filter(l => l.groupId === g.id && l.status === 'planned' && `${l.date} ${l.time}` >= `${todayISO()} 00:00`).sort((a, b) => `${a.date} ${a.time}`.localeCompare(`${b.date} ${b.time}`))[0];
+              const members = (g.studentIds || []).map(studentById).filter(Boolean);
+              return `<div class="student" data-group-id="${g.id}"><div class="avatar group-avatar">👥</div><div class="student-main"><strong>${escapeHTML(g.name)}</strong><small>${escapeHTML(g.subject || 'Без предмета')} • ${members.length} уч.${next ? ` • далі ${localeDate(next.date)} о ${next.time}` : ''}</small></div><div class="amount">${money(groupExpectedPrice(g))}</div><span class="chev">›</span></div>`;
+          }).join('') : emptyState('👥', q ? 'Нічого не знайдено' : 'Ще немає груп', q ? 'Спробуйте інший запит.' : 'Створіть групу, додайте учнів і регулярний розклад.', 'add-group', 'Створити групу')}
+        </div>
+      </section>`;
+            return;
+        }
+        const students = state.students.filter(s => !q || `${s.name} ${s.subject} ${s.phone || ''}`.toLowerCase().includes(q)).sort((a, b) => a.name.localeCompare(b.name, 'uk'));
+        app.innerHTML = `
+      <section class="section">
+        <div class="segmented people-tabs"><button class="active" data-people-view="students">Учні (${state.students.length})</button><button data-people-view="groups">Групи (${state.groups.length})</button></div>
+        <div class="toolbar"><input id="studentSearch" class="search" placeholder="Пошук за ім’ям або предметом" value="${escapeHTML(query)}"><button class="primary-btn" data-action="add-student">＋</button></div>
+        <div class="student-list">
+          ${students.length ? students.map(s => {
+            const next = lessonsForStudent(s.id).filter(l => l.status === 'planned' && `${l.date} ${l.time}` >= `${todayISO()} 00:00`).sort((a, b) => `${a.date} ${a.time}`.localeCompare(`${b.date} ${b.time}`))[0];
+            const groups = state.groups.filter(g => Array.isArray(g.studentIds) && g.studentIds.includes(s.id));
+            return `<div class="student" data-student-id="${s.id}"><div class="avatar">${initials(s.name)}</div><div class="student-main"><strong>${escapeHTML(s.name)}</strong><small>${escapeHTML(s.subject || 'Без предмета')}${groups.length ? ` • ${groups.length} груп.` : ''}${next ? ` • далі ${localeDate(next.date)} о ${next.time}` : ' • немає майбутніх занять'}</small></div><div class="amount">${money(s.rate || 0)}</div><span class="chev">›</span></div>`;
+        }).join('') : emptyState('♙', q ? 'Нічого не знайдено' : 'Ще немає учнів', q ? 'Спробуйте інший запит.' : 'Створіть профіль учня, одразу задайте його розклад і ведіть історію.', 'add-student', 'Додати учня')}
+        </div>
+      </section>`;
+    }
+    function renderPayments() {
+        const now = new Date();
+        const monthTotal = state.payments.filter(p => monthKey(p.date) === thisMonthKey()).reduce((a, p) => a + Number(p.amount || 0), 0);
+        const year = now.getFullYear();
+        const yearTotal = state.payments.filter(p => Number(p.date.slice(0, 4)) === year).reduce((a, p) => a + Number(p.amount || 0), 0);
+        const allTotal = state.payments.reduce((a, p) => a + Number(p.amount || 0), 0);
+        const monthsCount = paymentRange === '3m' ? 3 : paymentRange === '12m' ? 12 : 6;
+        const bars = [];
+        for (let i = monthsCount - 1; i >= 0; i--) {
+            const d = new Date(year, now.getMonth() - i, 1);
+            const key = `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
+            const total = state.payments.filter(p => monthKey(p.date) === key).reduce((a, p) => a + Number(p.amount || 0), 0);
+            bars.push({ label: new Intl.DateTimeFormat('uk-UA', { month: 'short' }).format(d).replace('.', ''), total });
+        }
+        const max = Math.max(...bars.map(b => b.total), 1);
+        const payments = [...state.payments].sort((a, b) => `${b.date} ${b.createdAt || ''}`.localeCompare(`${a.date} ${a.createdAt || ''}`));
+        app.innerHTML = `
+      <section class="section hero">
+        <div class="hero-top"><div><div class="label">Надходження цього місяця</div><div class="big-number">${money(monthTotal)}</div></div><div class="pill">${state.payments.length} оплат</div></div>
+        <div class="hero-grid"><div class="hero-stat"><small>Рік</small><strong>${money(yearTotal)}</strong></div><div class="hero-stat"><small>Усього</small><strong>${money(allTotal)}</strong></div><div class="hero-stat"><small>Середня</small><strong>${money(state.payments.length ? allTotal / state.payments.length : 0)}</strong></div></div>
+      </section>
+      <section class="section card">
+        <div class="section-head"><h2>Динаміка доходу</h2></div>
+        <div class="segmented"><button data-range="3m" class="${paymentRange === '3m' ? 'active' : ''}">3 міс.</button><button data-range="6m" class="${paymentRange === '6m' ? 'active' : ''}">6 міс.</button><button data-range="12m" class="${paymentRange === '12m' ? 'active' : ''}">12 міс.</button></div>
+        <div class="chart">${bars.map(b => `<div class="bar-wrap" title="${escapeHTML(b.label)}: ${money(b.total)}"><div class="bar" style="height:${Math.max(3, (b.total / max) * 100)}%"></div><small>${escapeHTML(b.label)}</small></div>`).join('')}</div>
+      </section>
+      <section class="section"><div class="section-head"><h2>Історія оплат</h2><button data-action="add-payment">Додати</button></div><div class="payment-list">${payments.length ? payments.map(paymentRow).join('') : emptyState('₴', 'Оплат ще немає', 'Фіксуйте кожне надходження, щоб бачити статистику.', 'add-payment', 'Додати оплату')}</div></section>`;
+    }
+    function paymentRow(p) {
+        const s=studentById(p.studentId), g=groupById(p.groupId);
+        const name=s?s.name:(g?'👥 '+g.name:'Запис видалено');
+        return `<div class="payment" data-payment-id="${p.id}"><div class="avatar">₴</div><div class="payment-main"><strong>${escapeHTML(name)}</strong><small>${localeDate(p.date,{day:'numeric',month:'long',year:'numeric'})}${p.method?` • ${escapeHTML(p.method)}`:''}${p.packageId?' • абонемент':''}</small></div><div class="amount">+${money(p.amount)}</div><span class="chev">›</span></div>`;
+    }
+    function renderSettings() {
+        app.innerHTML = `
+      <section class="section card">
+        <div class="profile-head"><div class="profile-avatar">TN</div><div><h3>${escapeHTML(state.tutor.name || 'TutorNote')}</h3><p>Персональний локальний органайзер</p></div></div>
+        <div class="note-box">Дані зберігаються локально. TutorNote автоматично створює до ${MAX_BACKUPS} локальних знімків. Є День / Тиждень / Місяць, абонементи, баланси, групові тарифи та розумний регулярний розклад. Видалені записи спочатку потрапляють у кошик.</div>
+      </section>
+      <section class="section">
+        <div class="section-head"><h2>Персоналізація</h2></div>
+        <div class="setting-group">
+          <button class="setting-row" data-action="rename"><div><div class="setting-title">Назва / ім’я</div><small>${escapeHTML(state.tutor.name)}</small></div><span class="chev">›</span></button>
+          <button class="setting-row" data-action="toggle-theme"><div><div class="setting-title">Темна тема</div><small>${state.tutor.dark ? 'Увімкнено' : 'Вимкнено'}</small></div><strong>${state.tutor.dark ? '●' : '○'}</strong></button>
+        </div>
+      </section>
+      <section class="section">
+        <div class="section-head"><h2>Захист адміністратора</h2></div>
+        <div class="setting-group">
+          <button class="setting-row" data-action="set-pin"><div><div class="setting-title">${getAdminConfig() && getAdminConfig().enabled ? 'Змінити PIN адміністратора' : 'Створити PIN адміністратора'}</div><small>${getAdminConfig() && getAdminConfig().enabled ? 'Видалення та небезпечні дії захищені PIN' : 'Рекомендовано: 4–8 цифр'}</small></div><span class="chev">›</span></button>
+          <button class="setting-row" data-action="trash"><div><div class="setting-title">Кошик</div><small>${state.trash.length} видалених записів • відновлення без втрати</small></div><span class="chev">›</span></button>
+        </div>
+      </section>
+      <section class="section">
+        <div class="section-head"><h2>Зашифрована хмарна копія</h2></div>
+        <div class="setting-group">
+          <button class="setting-row" data-action="cloud"><div><div class="setting-title">Cloud Backup</div><small>${cloudStatusText()}</small></div><span class="chev">›</span></button>
+          <button class="setting-row" data-action="cloud-backup-now"><div><div class="setting-title">Зберегти в хмару зараз</div><small>AES‑256‑GCM • дані шифруються до відправлення</small></div><span class="chev">›</span></button>
+        </div>
+      </section>
+      <section class="section">
+        <div class="section-head"><h2>Автоматичні резервні копії</h2></div>
+        <div class="setting-group">
+          <button class="setting-row" data-action="backups"><div><div class="setting-title">Історія автокопій</div><small>Остання: ${backupMetaText()} • до ${MAX_BACKUPS} версій</small></div><span class="chev">›</span></button>
+          <button class="setting-row" data-action="backup-now"><div><div class="setting-title">Створити копію зараз</div><small>Додатковий локальний знімок поточного стану</small></div><span class="chev">›</span></button>
+        </div>
+      </section>
+      <section class="section">
+        <div class="section-head"><h2>Дані</h2></div>
+        <div class="setting-group">
+          <button class="setting-row" data-action="export"><div><div class="setting-title">Експорт резервної копії</div><small>Учні, групи, розклади, абонементи, заняття та оплати у JSON</small></div><span class="chev">›</span></button>
+          <button class="setting-row" data-action="import"><div><div class="setting-title">Імпорт резервної копії</div><small>Відновити дані з JSON</small></div><span class="chev">›</span></button>
+          <button class="setting-row" data-action="demo"><div><div class="setting-title">Додати демо-дані</div><small>Швидко подивитися можливості</small></div><span class="chev">›</span></button>
+          <button class="setting-row" data-action="clear"><div><div class="setting-title" style="color:var(--danger)">Очистити всі дані</div><small>Потребує PIN адміністратора; перед очищенням створиться копія</small></div><span class="chev">›</span></button>
+        </div>
+      </section>
+      <section class="section">
+        <div class="section-head"><h2>Встановлення</h2></div>
+        <div class="card"><strong>Як додаток на телефоні</strong><p class="kicker" style="margin-top:6px">У PWA-режимі відкрийте сайт у браузері та виберіть «Додати на головний екран». Після першого відкриття застосунок працює офлайн.</p><button class="secondary-btn full" data-action="install">Спробувати встановити</button></div>
+      </section>`;
+    }
+    function render() {
+        renderHeader();
+        if (currentPage === 'home')
+            renderHome();
+        if (currentPage === 'schedule')
+            renderSchedule();
+        if (currentPage === 'students')
+            renderStudents();
+        if (currentPage === 'payments')
+            renderPayments();
+        if (currentPage === 'settings')
+            renderSettings();
+        window.scrollTo({ top: 0, behavior: 'instant' });
+    }
+    function go(page) { currentPage = page; render(); }
+    function lessonForm(existing = null, defaults = {}) {
+        if(!state.students.length&&!state.groups.length){openModal('Потрібен учень або група',`${emptyState('♙','Спочатку додайте учня або групу','Заняття має бути прив’язане до учня чи групи.')}<div class="inline-actions"><button class="primary-btn" data-action="add-student">Додати учня</button><button class="secondary-btn" data-action="add-group">Створити групу</button></div>`);return;}
+        const firstOwner=state.students.length?{type:'student',id:state.students[0].id,entity:state.students[0]}:{type:'group',id:state.groups[0].id,entity:state.groups[0]};
+        const baseOwner=existing?(existing.groupId?{type:'group',id:existing.groupId,entity:groupById(existing.groupId)}:{type:'student',id:existing.studentId,entity:studentById(existing.studentId)}):(defaults.groupId?{type:'group',id:defaults.groupId,entity:groupById(defaults.groupId)}:defaults.studentId?{type:'student',id:defaults.studentId,entity:studentById(defaults.studentId)}:firstOwner);
+        const defaultPrice=baseOwner.type==='group'?groupExpectedPrice(baseOwner.entity):Number((baseOwner.entity&&baseOwner.entity.rate)||0);
+        const l=existing||Object.assign({studentId:baseOwner.type==='student'?baseOwner.id:'',groupId:baseOwner.type==='group'?baseOwner.id:'',date:selectedDate||todayISO(),time:'16:00',duration:60,subject:(baseOwner.entity&&baseOwner.entity.subject)||'',price:defaultPrice,status:'planned',paid:false,notes:''},defaults);
+        const ownerValue=l.groupId?`group:${l.groupId}`:`student:${l.studentId||firstOwner.id}`;
+        openModal(existing?'Редагувати заняття':'Нове заняття', `<form id="lessonForm" data-id="${(existing&&existing.id)||''}"><div class="form-grid">
+          <div class="field"><label>Учень або група</label><select name="owner" required>${state.students.length?`<optgroup label="Учні">${state.students.map(s=>`<option value="student:${s.id}" ${ownerValue===`student:${s.id}`?'selected':''}>${escapeHTML(s.name)}</option>`).join('')}</optgroup>`:''}${state.groups.length?`<optgroup label="Групи">${state.groups.map(g=>`<option value="group:${g.id}" ${ownerValue===`group:${g.id}`?'selected':''}>👥 ${escapeHTML(g.name)}</option>`).join('')}</optgroup>`:''}</select></div>
+          <div class="form-grid two"><div class="field"><label>Дата</label><input type="date" name="date" value="${escapeHTML(l.date)}" required></div><div class="field"><label>Час</label><input type="time" name="time" value="${escapeHTML(l.time)}" required></div></div>
+          <div class="form-grid two"><div class="field"><label>Тривалість, хв</label><input type="number" name="duration" min="15" step="5" value="${Number(l.duration||60)}" required></div><div class="field"><label>Вартість / очікуваний дохід, ₴</label><input type="number" name="price" min="0" step="1" value="${Number(l.price||0)}"></div></div>
+          <div class="field"><label>Предмет / тема</label><input name="subject" value="${escapeHTML(l.subject||'')}" placeholder="Напр. Математика"></div>
+          <div class="form-grid two"><div class="field"><label>Статус</label><select name="status">${LESSON_STATUSES.map(x=>`<option value="${x.value}" ${l.status===x.value||(l.status==='cancelled'&&x.value==='cancelled_student')?'selected':''}>${x.label}</option>`).join('')}</select></div><div class="field"><label>Оплата</label><select name="paid"><option value="false" ${!l.paid?'selected':''}>Не оплачено</option><option value="true" ${l.paid?'selected':''}>Оплачено</option></select></div></div>
+          <div class="field"><label>Примітка</label><textarea name="notes" placeholder="Домашнє завдання, тема уроку…">${escapeHTML(l.notes||'')}</textarea></div>
+          ${l.autoRecurring?'<div class="note-box">Це регулярне заняття. Перенесення конкретного заняття не змінює весь регулярний шаблон.</div>':''}
+        </div>${existing?`<div class="inline-actions"><button type="button" class="secondary-btn" data-action="reschedule-lesson" data-id="${existing.id}">↗ Перенести</button><button type="button" class="danger-btn" data-action="delete-lesson" data-id="${existing.id}">У кошик</button>${existing.studentId&&!existing.paid&&existing.status==='done'?`<button type="button" class="secondary-btn" data-action="pay-lesson" data-id="${existing.id}">Зафіксувати оплату</button>`:''}</div>`:''}<div class="form-actions"><button type="button" class="secondary-btn" data-action="close-modal">Скасувати</button><button class="primary-btn" type="submit">${existing?'Зберегти':'Створити заняття'}</button></div></form>`);
+        const select=$('#lessonForm select[name="owner"]');
+        if(!existing) select.addEventListener('change',()=>{const owner=ownerFromValue(select.value);if(!owner)return;$('#lessonForm input[name="price"]').value=owner.type==='group'?groupExpectedPrice(owner.entity):owner.rate||0;if(!$('#lessonForm input[name="subject"]').value)$('#lessonForm input[name="subject"]').value=owner.subject||'';});
+    }
+    function hasConflict(candidate, excludeId = '') {
+        const start=toMinutes(candidate.time), end=start+Number(candidate.duration||60);
+        return state.lessons.some(l=>{ if(l.id===excludeId||l.date!==candidate.date||!blocksCalendar(l.status)) return false; const ls=toMinutes(l.time), le=ls+Number(l.duration||60); return start<le&&end>ls; });
+    }
+    function studentForm(existing = null) {
+        const s = existing || { name: '', subject: '', phone: '', rate: '', notes: '', weeklySchedule: [], scheduleStart: todayISO() };
+        openModal(existing ? 'Редагувати учня' : 'Новий учень', `
+      <form id="studentForm" data-id="${(existing === null || existing === void 0 ? void 0 : existing.id) || ''}">
+        <div class="form-grid">
+          <div class="field"><label>Ім’я</label><input name="name" value="${escapeHTML(s.name)}" placeholder="Ім’я учня" required></div>
+          <div class="field"><label>Предмет / напрям</label><input name="subject" value="${escapeHTML(s.subject || '')}" placeholder="Математика, англійська…"></div>
+          <div class="form-grid two"><div class="field"><label>Телефон / контакт</label><input name="phone" value="${escapeHTML(s.phone || '')}" placeholder="+380…"></div><div class="field"><label>Ставка, ₴</label><input type="number" min="0" name="rate" value="${escapeHTML(s.rate || '')}" placeholder="500"></div></div>
+          ${scheduleEditorHTML(s.weeklySchedule || [], s.scheduleStart || todayISO())}
+          <div class="field"><label>Важливі примітки</label><textarea name="notes" placeholder="Цілі, особливості, прогрес…">${escapeHTML(s.notes || '')}</textarea></div>
+        </div>
+        ${existing ? `<div class="inline-actions"><button type="button" class="danger-btn" data-action="delete-student" data-id="${existing.id}">У кошик</button></div>` : ''}
+        <div class="form-actions"><button type="button" class="secondary-btn" data-action="close-modal">Скасувати</button><button class="primary-btn" type="submit">${existing ? 'Зберегти' : 'Додати учня'}</button></div>
+      </form>`);
+    }
+    function groupForm(existing = null) {
+        const g=existing||{name:'',subject:'',rate:'',priceMode:'per_student',notes:'',studentIds:[],weeklySchedule:[],scheduleStart:todayISO()};
+        openModal(existing?'Редагувати групу':'Нова група', `
+      <form id="groupForm" data-id="${(existing&&existing.id)||''}"><div class="form-grid">
+        <div class="field"><label>Назва групи</label><input name="name" value="${escapeHTML(g.name||'')}" placeholder="Напр. НМТ — група 1" required></div>
+        <div class="field"><label>Предмет / напрям</label><input name="subject" value="${escapeHTML(g.subject||'')}" placeholder="Математика"></div>
+        <div class="form-grid two"><div class="field"><label>Модель оплати</label><select name="priceMode"><option value="per_student" ${groupPaymentMode(g)==='per_student'?'selected':''}>За кожного учня</option><option value="total" ${groupPaymentMode(g)==='total'?'selected':''}>За всю групу</option></select></div><div class="field"><label>Ставка, ₴</label><input type="number" min="0" name="rate" value="${escapeHTML(g.rate||'')}" placeholder="250"></div></div>
+        <div class="note-box">«За кожного учня»: 4 × 250 ₴ = 1000 ₴ за заняття. «За всю групу»: ставка є загальною сумою за заняття.</div>
+        <div class="field"><label>Учасники</label><div class="member-picker">${state.students.length?state.students.map(s=>`<label class="member-option"><input type="checkbox" name="memberId" value="${s.id}" ${(g.studentIds||[]).includes(s.id)?'checked':''}><span><strong>${escapeHTML(s.name)}</strong><small>${escapeHTML(s.subject||'Без предмета')}</small></span></label>`).join(''):'<div class="schedule-empty">Учнів ще немає. Групу можна створити зараз і додати учасників пізніше.</div>'}</div></div>
+        ${scheduleEditorHTML(g.weeklySchedule||[],g.scheduleStart||todayISO())}
+        <div class="field"><label>Примітки</label><textarea name="notes" placeholder="Рівень групи, цілі, особливості…">${escapeHTML(g.notes||'')}</textarea></div>
+      </div>${existing?`<div class="inline-actions"><button type="button" class="danger-btn" data-action="delete-group" data-id="${existing.id}">У кошик</button></div>`:''}<div class="form-actions"><button type="button" class="secondary-btn" data-action="close-modal">Скасувати</button><button class="primary-btn" type="submit">${existing?'Зберегти':'Створити групу'}</button></div></form>`);
+    }
+    function paymentForm(existing = null, preStudentId = '', lessonId = '', preGroupId = '') {
+        if(!state.students.length&&!state.groups.length){openModal('Потрібен учень або група',`${emptyState('₴','Немає отримувачів','Додайте учня або групу.')}`);return;}
+        const relatedLesson=lessonId?lessonById(lessonId):null;
+        let targetValue='';
+        if(existing) targetValue=existing.groupId?`group:${existing.groupId}`:`student:${existing.studentId}`;
+        else if(preGroupId||(relatedLesson&&relatedLesson.groupId)) targetValue=`group:${preGroupId||(relatedLesson&&relatedLesson.groupId)}`;
+        else targetValue=`student:${preStudentId||(relatedLesson&&relatedLesson.studentId)||(state.students[0]&&state.students[0].id)||''}`;
+        const owner=ownerFromValue(targetValue);
+        const defaultAmount=relatedLesson?lessonExpectedRevenue(relatedLesson):(owner?(owner.type==='group'?groupExpectedPrice(owner.entity):Number(owner.rate||0)):0);
+        const p=existing||{amount:defaultAmount,date:todayISO(),method:'Переказ',note:'',lessonId:lessonId||''};
+        openModal(existing?'Редагувати оплату':'Нова оплата', `<form id="paymentForm" data-id="${(existing&&existing.id)||''}" data-lesson-id="${escapeHTML(p.lessonId||'')}"><div class="form-grid">
+          <div class="field"><label>Учень або група</label><select name="target" required>${state.students.length?`<optgroup label="Учні">${state.students.map(s=>`<option value="student:${s.id}" ${targetValue===`student:${s.id}`?'selected':''}>${escapeHTML(s.name)}</option>`).join('')}</optgroup>`:''}${state.groups.length?`<optgroup label="Групи">${state.groups.map(g=>`<option value="group:${g.id}" ${targetValue===`group:${g.id}`?'selected':''}>👥 ${escapeHTML(g.name)}</option>`).join('')}</optgroup>`:''}</select></div>
+          <div class="form-grid two"><div class="field"><label>Сума, ₴</label><input type="number" min="0" step="1" name="amount" value="${Number(p.amount||0)}" required></div><div class="field"><label>Дата</label><input type="date" name="date" value="${escapeHTML(p.date)}" required></div></div>
+          <div class="field"><label>Спосіб</label><select name="method"><option ${p.method==='Переказ'?'selected':''}>Переказ</option><option ${p.method==='Готівка'?'selected':''}>Готівка</option><option ${p.method==='Інше'?'selected':''}>Інше</option></select></div>
+          <div class="field"><label>Примітка</label><textarea name="note" placeholder="Напр. оплата за заняття">${escapeHTML(p.note||'')}</textarea></div>
+        </div>${existing?`<div class="inline-actions"><button type="button" class="danger-btn" data-action="delete-payment" data-id="${existing.id}">У кошик</button></div>`:''}<div class="form-actions"><button type="button" class="secondary-btn" data-action="close-modal">Скасувати</button><button class="primary-btn" type="submit">${existing?'Зберегти':'Зафіксувати оплату'}</button></div></form>`);
+    }
+    function studentProfile(id) {
+        const s=studentById(id); if(!s) return;
+        const lessons=lessonsForStudent(id), payments=paymentsForStudent(id);
+        const upcoming=lessons.filter(l=>l.status==='planned'&&`${l.date} ${l.time}`>=`${todayISO()} 00:00`).sort((a,b)=>`${a.date} ${a.time}`.localeCompare(`${b.date} ${b.time}`))[0];
+        const groups=state.groups.filter(g=>Array.isArray(g.studentIds)&&g.studentIds.includes(id));
+        const done=lessons.filter(l=>l.status==='done').length;
+        const missed=lessons.filter(l=>l.status==='no_show').length;
+        const lastPayment=[...payments].sort((a,b)=>`${b.date} ${b.createdAt||''}`.localeCompare(`${a.date} ${a.createdAt||''}`))[0];
+        const income=studentPaymentsTotal(id), balance=studentBalance(id), packages=packagesForStudent(id);
+        openModal('Профіль учня', `
+      <div class="profile-head"><div class="profile-avatar">${initials(s.name)}</div><div><h3>${escapeHTML(s.name)}</h3><p>${escapeHTML(s.subject||'Без предмета')}${s.phone?` • ${escapeHTML(s.phone)}`:''}</p></div></div>
+      <div class="profile-stats crm-stats"><div class="profile-stat"><small>Баланс</small><strong class="${balance<0?'negative-balance':'positive-balance'}">${formatBalance(balance)}</strong></div><div class="profile-stat"><small>Проведено</small><strong>${done}</strong></div><div class="profile-stat"><small>Пропуски</small><strong>${missed}</strong></div><div class="profile-stat"><small>Загальний дохід</small><strong>${money(income)}</strong></div><div class="profile-stat"><small>Остання оплата</small><strong>${lastPayment?money(lastPayment.amount):'—'}</strong></div><div class="profile-stat"><small>Ставка</small><strong>${money(s.rate||0)}</strong></div></div>
+      ${upcoming?`<div class="note-box" style="margin-bottom:10px">Наступне заняття: <strong>${formatLongDate(upcoming.date)}, ${upcoming.time}</strong></div>`:'<div class="note-box" style="margin-bottom:10px">Майбутніх занять немає.</div>'}
+      <div class="note-box schedule-summary"><strong>Регулярний розклад</strong><div>${escapeHTML(scheduleSummary(s.weeklySchedule||[]))}</div></div>
+      ${groups.length?`<div class="section"><div class="section-head"><h2>Групи</h2></div><div class="chip-list">${groups.map(g=>`<button class="mini-chip" data-group-id="${g.id}">👥 ${escapeHTML(g.name)}</button>`).join('')}</div></div>`:''}
+      <div class="section"><div class="section-head"><h2>Абонементи</h2><button data-action="add-package" data-id="${s.id}">＋ Додати</button></div>${packages.length?`<div class="package-list">${packages.map(pkg=>{const rem=packageRemaining(pkg);return `<div class="package-card ${rem<=2&&rem>0?'low':''}"><div><strong>${rem}/${pkg.lessonsTotal} залишилось</strong><small>${money(pkg.totalPrice)} • від ${localeDate(pkg.purchasedAt||todayISO(),{day:'2-digit',month:'2-digit',year:'numeric'})}</small></div><span>${money(packageUnitPrice(pkg))}/зан.</span></div>`;}).join('')}</div>`:emptyState('◎','Абонементів немає','Додайте пакет занять, якщо учень оплачує наперед.')}</div>
+      ${s.notes?`<div class="section"><div class="section-head"><h2>Примітки</h2></div><div class="note-box">${escapeHTML(s.notes)}</div></div>`:''}
+      <div class="section"><div class="section-head"><h2>Останні заняття</h2></div><div class="lesson-list">${lessons.slice(0,5).length?lessons.slice(0,5).map(lessonRow).join(''):emptyState('▦','Історія порожня','Занять з цим учнем ще немає.')}</div></div>
+      <div class="inline-actions"><button class="primary-btn" data-action="add-lesson-student" data-id="${s.id}">＋ Заняття</button><button class="secondary-btn" data-action="add-payment-student" data-id="${s.id}">₴ Оплата</button><button class="secondary-btn" data-action="edit-student" data-id="${s.id}">Редагувати</button></div>`);
+    }
+    function groupProfile(id) {
+        const g=groupById(id); if(!g) return;
+        const lessons=lessonsForGroup(id), members=(g.studentIds||[]).map(studentById).filter(Boolean);
+        const upcoming=lessons.filter(l=>l.status==='planned'&&`${l.date} ${l.time}`>=`${todayISO()} 00:00`).sort((a,b)=>`${a.date} ${a.time}`.localeCompare(`${b.date} ${b.time}`))[0];
+        const done=lessons.filter(l=>l.status==='done').length;
+        const expected=groupExpectedPrice(g), received=groupPaymentsTotal(id), balance=groupBalance(id);
+        openModal('Профіль групи', `
+      <div class="profile-head"><div class="profile-avatar">👥</div><div><h3>${escapeHTML(g.name)}</h3><p>${escapeHTML(g.subject||'Без предмета')} • ${members.length} уч.</p></div></div>
+      <div class="profile-stats crm-stats"><div class="profile-stat"><small>${groupPaymentMode(g)==='per_student'?'За учня':'За групу'}</small><strong>${money(g.rate||0)}</strong></div><div class="profile-stat"><small>Дохід / заняття</small><strong>${money(expected)}</strong></div><div class="profile-stat"><small>Проведено</small><strong>${done}</strong></div>${groupPaymentMode(g)==='total'?`<div class="profile-stat"><small>Баланс групи</small><strong class="${balance<0?'negative-balance':'positive-balance'}">${formatBalance(balance)}</strong></div><div class="profile-stat"><small>Отримано</small><strong>${money(received)}</strong></div>`:''}<div class="profile-stat"><small>Учасників</small><strong>${members.length}</strong></div></div>
+      <div class="note-box schedule-summary"><strong>Регулярний розклад</strong><div>${escapeHTML(scheduleSummary(g.weeklySchedule||[]))}</div></div>
+      ${members.length?`<div class="section"><div class="section-head"><h2>Учасники</h2></div><div class="chip-list">${members.map(s=>`<button class="mini-chip" data-student-id="${s.id}">${escapeHTML(s.name)}</button>`).join('')}</div></div>`:''}
+      ${upcoming?`<div class="note-box" style="margin-bottom:10px">Наступне заняття: <strong>${formatLongDate(upcoming.date)}, ${upcoming.time}</strong></div>`:''}
+      ${g.notes?`<div class="section"><div class="section-head"><h2>Примітки</h2></div><div class="note-box">${escapeHTML(g.notes)}</div></div>`:''}
+      <div class="section"><div class="section-head"><h2>Останні заняття</h2></div><div class="lesson-list">${lessons.slice(0,5).length?lessons.slice(0,5).map(lessonRow).join(''):emptyState('▦','Історія порожня','Занять із цією групою ще немає.')}</div></div>
+      <div class="inline-actions"><button class="primary-btn" data-action="add-lesson-group" data-id="${g.id}">＋ Заняття</button>${groupPaymentMode(g)==='total'?`<button class="secondary-btn" data-action="add-payment-group" data-id="${g.id}">₴ Оплата групи</button>`:''}<button class="secondary-btn" data-action="edit-group" data-id="${g.id}">Редагувати</button></div>`);
+    }
+    function paymentDetails(id) {
+        const p=paymentById(id); if(!p) return;
+        const s=studentById(p.studentId), g=groupById(p.groupId);
+        const name=s?s.name:(g?'👥 '+g.name:'Запис видалено');
+        openModal('Оплата', `<div class="card" style="box-shadow:none"><div class="eyebrow">${localeDate(p.date,{day:'numeric',month:'long',year:'numeric'})}</div><div class="big-number" style="font-size:34px;font-weight:900;margin:5px 0">${money(p.amount)}</div><strong>${escapeHTML(name)}</strong><p class="kicker" style="margin-top:4px">${escapeHTML(p.method||'')} ${p.packageId?'• абонемент ':''}${p.note?`• ${escapeHTML(p.note)}`:''}</p></div><div class="inline-actions"><button class="secondary-btn" data-action="edit-payment" data-id="${p.id}">Редагувати</button><button class="danger-btn" data-action="delete-payment" data-id="${p.id}">У кошик</button></div>`);
+    }
+    function packageForm(studentId) {
+        const student=studentById(studentId); if(!student) return;
+        openModal('Новий абонемент', `<form id="packageForm" data-student-ref="${student.id}"><div class="form-grid">
+          <div class="note-box"><strong>${escapeHTML(student.name)}</strong><br>Після статусу «Проведено» заняття автоматично спише 1 урок із активного абонемента.</div>
+          <div class="form-grid two"><div class="field"><label>Кількість занять</label><input type="number" name="lessonsTotal" min="1" step="1" value="8" required></div><div class="field"><label>Вартість пакета, ₴</label><input type="number" name="totalPrice" min="0" step="1" value="${Number(student.rate||0)*8}" required></div></div>
+          <div class="field"><label>Дата покупки</label><input type="date" name="purchasedAt" value="${todayISO()}" required></div>
+          <label class="check-row"><input type="checkbox" name="recordPayment" checked><span>Одразу зафіксувати оплату пакета</span></label>
+        </div><div class="form-actions"><button type="button" class="secondary-btn" data-action="close-modal">Скасувати</button><button class="primary-btn" type="submit">Створити абонемент</button></div></form>`);
+    }
+    function rescheduleForm(lesson) {
+        if(!lesson) return;
+        openModal('Перенести заняття', `<form id="rescheduleForm" data-id="${lesson.id}"><div class="note-box">Старе заняття залишиться в історії зі статусом «Перенесено», а на нову дату буде створене нове заплановане заняття.</div><div class="form-grid two" style="margin-top:11px"><div class="field"><label>Нова дата</label><input type="date" name="date" value="${lesson.date}" required></div><div class="field"><label>Новий час</label><input type="time" name="time" value="${lesson.time}" required></div></div><div class="form-actions"><button type="button" class="secondary-btn" data-action="close-modal">Скасувати</button><button class="primary-btn" type="submit">Перенести</button></div></form>`);
+    }
+    function recurringDecisionModal(kind, id, data, newSchedule, newStart, oldSchedule, oldStart) {
+        pendingRecurringChange={kind,id,data,newSchedule,newStart,oldSchedule,oldStart};
+        openModal('Як змінити регулярний розклад?', `<div class="note-box">Минулі заняття не змінюються. Оберіть, як застосувати новий час.</div><div class="form-grid" style="margin-top:12px"><button class="secondary-btn full" data-action="apply-schedule-next">Лише найближче заняття</button><button class="primary-btn full" data-action="apply-schedule-all">Усі майбутні заняття</button><button class="secondary-btn full" data-action="cancel-schedule-change">Не змінювати розклад</button></div>`);
+    }
+    function quickAdd() {
+        openModal('Швидко додати', `<div class="form-grid"><button class="setting-row" data-action="add-lesson"><div><div class="setting-title">Нове заняття</div><small>Запланувати дату, час і вартість</small></div><span class="chev">›</span></button><button class="setting-row" data-action="add-student"><div><div class="setting-title">Нового учня</div><small>Профіль + регулярний розклад</small></div><span class="chev">›</span></button><button class="setting-row" data-action="add-group"><div><div class="setting-title">Нову групу</div><small>Учасники + груповий розклад</small></div><span class="chev">›</span></button><button class="setting-row" data-action="add-payment"><div><div class="setting-title">Нову оплату</div><small>Зафіксувати надходження</small></div><span class="chev">›</span></button></div>`);
+    }
+    function readFileAsText(file) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(String(reader.result || ''));
+            reader.onerror = () => reject(reader.error || new Error('File read error'));
+            reader.readAsText(file);
+        });
+    }
+    function exportData() {
+        const blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `TutorNote-backup-${todayISO()}.json`;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        toast('Резервну копію створено');
+    }
+    function addDemoData() {
+        if (!confirm('Додати кілька демонстраційних учнів, занять та оплат?'))
+            return;
+        const s1 = { id: uid('s'), name: 'Анна Коваль', subject: 'Математика', phone: '', rate: 500, notes: 'Підготовка до НМТ. Звернути увагу на геометрію.' };
+        const s2 = { id: uid('s'), name: 'Максим Бондар', subject: 'Англійська', phone: '', rate: 450, notes: 'Рівень B1. Більше практики speaking.' };
+        state.students.push(s1, s2);
+        const d0 = new Date();
+        const d1 = new Date();
+        d1.setDate(d1.getDate() + 1);
+        const d2 = new Date();
+        d2.setDate(d2.getDate() + 3);
+        state.lessons.push({ id: uid('l'), studentId: s1.id, date: isoFromDate(d0), time: '16:00', duration: 60, subject: 'Математика', price: 500, status: 'planned', paid: false, notes: '' }, { id: uid('l'), studentId: s2.id, date: isoFromDate(d1), time: '18:00', duration: 60, subject: 'Англійська', price: 450, status: 'planned', paid: false, notes: '' }, { id: uid('l'), studentId: s1.id, date: isoFromDate(d2), time: '15:30', duration: 90, subject: 'Математика', price: 700, status: 'planned', paid: false, notes: '' });
+        for (let i = 0; i < 4; i++) {
+            const d = new Date();
+            d.setMonth(d.getMonth() - i);
+            state.payments.push({ id: uid('p'), studentId: i % 2 ? s2.id : s1.id, amount: i % 2 ? 900 : 1000, date: isoFromDate(d), method: 'Переказ', note: '', createdAt: new Date().toISOString() });
+        }
+        save();
+        render();
+        toast('Демо-дані додано');
+    }
+    // Global navigation and item clicks
+    document.addEventListener('click', async e => {
+        const nav = e.target.closest('[data-page]');
+        if (nav) {
+            go(nav.dataset.page);
+            return;
+        }
+        const goEl = e.target.closest('[data-go]');
+        if (goEl) {
+            go(goEl.dataset.go);
+            return;
+        }
+        const dateEl = e.target.closest('[data-date]');
+        if (dateEl) {
+            selectedDate = dateEl.dataset.date;
+            renderSchedule();
+            return;
+        }
+        const peopleEl = e.target.closest('[data-people-view]');
+        if (peopleEl) {
+            peopleView = peopleEl.dataset.peopleView || 'students';
+            renderStudents();
+            return;
+        }
+        const lessonEl = e.target.closest('[data-lesson-id]');
+        if (lessonEl && !e.target.closest('button')) {
+            const l = lessonById(lessonEl.dataset.lessonId);
+            if (l)
+                lessonForm(l);
+            return;
+        }
+        const studentEl = e.target.closest('[data-student-id]');
+        if (studentEl) {
+            studentProfile(studentEl.dataset.studentId);
+            return;
+        }
+        const groupEl = e.target.closest('[data-group-id]');
+        if (groupEl) {
+            groupProfile(groupEl.dataset.groupId);
+            return;
+        }
+        const paymentEl = e.target.closest('[data-payment-id]');
+        if (paymentEl) {
+            paymentDetails(paymentEl.dataset.paymentId);
+            return;
+        }
+        const range = e.target.closest('[data-range]');
+        if (range) {
+            paymentRange = range.dataset.range;
+            renderPayments();
+            return;
+        }
+        const actionEl = e.target.closest('[data-action]');
+        if (!actionEl)
+            return;
+        const action = actionEl.dataset.action;
+        const id = actionEl.dataset.id;
+        if (action === 'close-modal') {
+            closeModal();
+            return;
+        }
+        if (action === 'today') {
+            selectedDate = todayISO();
+            renderSchedule();
+            return;
+        }
+        if (action === 'set-calendar-view') {
+            calendarView = actionEl.dataset.view || 'week';
+            renderSchedule();
+            return;
+        }
+        if (action === 'calendar-day') {
+            calendarView = 'day';
+            renderSchedule();
+            return;
+        }
+        if (action === 'prev-period' || action === 'next-period') {
+            const dir = action === 'next-period' ? 1 : -1;
+            const d = new Date(`${selectedDate}T12:00:00`);
+            if (calendarView === 'month') { d.setDate(1); d.setMonth(d.getMonth() + dir); }
+            else d.setDate(d.getDate() + dir * (calendarView === 'week' ? 7 : 1));
+            selectedDate = isoFromDate(d);
+            renderSchedule();
+            return;
+        }
+        if (action === 'add-lesson') {
+            closeModal();
+            lessonForm();
+            return;
+        }
+        if (action === 'add-student') {
+            closeModal();
+            studentForm();
+            return;
+        }
+        if (action === 'add-group') {
+            closeModal();
+            groupForm();
+            return;
+        }
+        if (action === 'add-payment') {
+            closeModal();
+            paymentForm();
+            return;
+        }
+        if (action === 'add-schedule-row') {
+            const editor = actionEl.closest('.schedule-editor');
+            const list = editor && $('.schedule-list', editor);
+            if (list) {
+                list.insertAdjacentHTML('beforeend', scheduleSlotRow());
+                const empty = $('.schedule-empty', editor);
+                if (empty) empty.remove();
+            }
+            return;
+        }
+        if (action === 'remove-schedule-row') {
+            const row = actionEl.closest('.schedule-row');
+            const editor = actionEl.closest('.schedule-editor');
+            if (row) row.remove();
+            const list = editor && $('.schedule-list', editor);
+            if (editor && list && !list.children.length && !$('.schedule-empty', editor)) {
+                list.insertAdjacentHTML('afterend', '<div class="schedule-empty">Розклад не задано. Натисніть «＋ Час», щоб додати регулярне заняття.</div>');
+            }
+            return;
+        }
+        if (action === 'edit-student') {
+            const s = studentById(id);
+            closeModal();
+            studentForm(s);
+            return;
+        }
+        if (action === 'edit-group') {
+            const g = groupById(id);
+            closeModal();
+            groupForm(g);
+            return;
+        }
+        if (action === 'add-lesson-student') {
+            const s = studentById(id);
+            closeModal();
+            lessonForm(null, { studentId: s.id, date: selectedDate || todayISO(), time: '16:00', duration: 60, subject: s.subject || '', price: s.rate || 0, status: 'planned', paid: false, notes: '' });
+            return;
+        }
+        if (action === 'add-lesson-group') {
+            const g = groupById(id);
+            closeModal();
+            lessonForm(null, { groupId: g.id, studentId: '', date: selectedDate || todayISO(), time: '16:00', duration: 60, subject: g.subject || '', price: groupExpectedPrice(g), status: 'planned', paid: false, notes: '' });
+            return;
+        }
+        if (action === 'add-payment-student') {
+            closeModal();
+            paymentForm(null, id);
+            return;
+        }
+        if (action === 'add-payment-group') {
+            closeModal();
+            paymentForm(null, '', '', id);
+            return;
+        }
+        if (action === 'add-package') {
+            closeModal();
+            packageForm(id);
+            return;
+        }
+        if (action === 'reschedule-lesson') {
+            const l = lessonById(id);
+            closeModal();
+            rescheduleForm(l);
+            return;
+        }
+        if (action === 'edit-payment') {
+            const p = paymentById(id);
+            closeModal();
+            paymentForm(p);
+            return;
+        }
+        if (action === 'pay-lesson') {
+            const l = lessonById(id);
+            closeModal();
+            paymentForm(null, l.studentId, l.id);
+            return;
+        }
+        if (action === 'apply-schedule-next' || action === 'apply-schedule-all' || action === 'cancel-schedule-change') {
+            const p = pendingRecurringChange;
+            if (!p) { closeModal(); return; }
+            const entity = p.kind === 'group' ? groupById(p.id) : studentById(p.id);
+            if (!entity) { pendingRecurringChange = null; closeModal(); return; }
+            if (action === 'apply-schedule-all') {
+                Object.assign(entity, p.data, { weeklySchedule: p.newSchedule, scheduleStart: p.newStart });
+                const result = syncRecurringLessons(p.kind, entity.id, p.newSchedule, p.newStart, entity, true);
+                refreshFutureSeriesPricing(p.kind, entity.id, entity);
+                save('Зміна всього майбутнього регулярного розкладу');
+                pendingRecurringChange = null; if (p.kind === 'group') peopleView = 'groups'; closeModal(); render();
+                toast(`Майбутній розклад оновлено • ${result.created} занять${result.skipped ? ` • ${result.skipped} накладок` : ''}`);
+                return;
+            }
+            Object.assign(entity, p.data, { weeklySchedule: p.oldSchedule, scheduleStart: p.oldStart });
+            let result = { changed: 0, skipped: 0 };
+            if (action === 'apply-schedule-next') result = applyNextOnlyScheduleChange(p.kind, entity, p.oldSchedule, p.newSchedule);
+            refreshFutureSeriesPricing(p.kind, entity.id, entity);
+            syncRecurringLessons(p.kind, entity.id, entity.weeklySchedule || [], entity.scheduleStart || todayISO(), entity, false);
+            save(action === 'apply-schedule-next' ? 'Зміна лише найближчого регулярного заняття' : 'Оновлення профілю без зміни розкладу');
+            pendingRecurringChange = null; if (p.kind === 'group') peopleView = 'groups'; closeModal(); render();
+            toast(action === 'apply-schedule-next' ? `Найближче заняття оновлено${result.skipped ? ' • є накладка' : ''}` : 'Профіль оновлено, розклад залишено без змін');
+            return;
+        }
+        if (action === 'delete-lesson') {
+            if (confirm('Перемістити це заняття в кошик? Його можна буде відновити.')) {
+                await createAutoBackup('Перед видаленням заняття', true);
+                moveToTrash('lesson', id);
+                closeModal(); render(); toast('Заняття переміщено в кошик');
+            }
+            return;
+        }
+        if (action === 'delete-student') {
+            if (confirm('Перемістити учня в кошик? Його заняття й оплати залишаться в історії.')) {
+                await createAutoBackup('Перед видаленням учня', true);
+                moveToTrash('student', id);
+                closeModal(); render(); toast('Учня переміщено в кошик');
+            }
+            return;
+        }
+        if (action === 'delete-group') {
+            if (confirm('Перемістити групу в кошик? Її заняття залишаться в історії.')) {
+                await createAutoBackup('Перед видаленням групи', true);
+                moveToTrash('group', id);
+                closeModal(); render(); toast('Групу переміщено в кошик');
+            }
+            return;
+        }
+        if (action === 'delete-payment') {
+            if (confirm('Перемістити цю оплату в кошик? Її можна буде відновити.')) {
+                await createAutoBackup('Перед видаленням оплати', true);
+                moveToTrash('payment', id);
+                closeModal(); render(); toast('Оплату переміщено в кошик');
+            }
+            return;
+        }
+        if (action === 'toggle-theme') {
+            state.tutor.dark = !state.tutor.dark;
+            save();
+            render();
+            return;
+        }
+        if (action === 'rename') {
+            const name = prompt('Як називати вашу робочу область?', state.tutor.name || 'TutorNote');
+            if (name === null || name === void 0 ? void 0 : name.trim()) {
+                state.tutor.name = name.trim();
+                save();
+                render();
+            }
+            return;
+        }
+        if (action === 'set-pin') {
+            if (getAdminConfig() && getAdminConfig().enabled) await changeAdminPin(); else await setupAdminPin();
+            return;
+        }
+        if (action === 'trash') { await showTrash(); return; }
+        if (action === 'backups') { await showBackups(); return; }
+        if (action === 'backup-now') { await createAutoBackup('Ручний локальний знімок', true); toast('Локальну копію створено'); render(); return; }
+        if (action === 'restore-trash') { restoreTrashItem(id); await showTrash(); toast('Запис відновлено'); return; }
+        if (action === 'purge-trash') {
+            if (!(await requireAdmin('стерти запис назавжди'))) return;
+            await createAutoBackup('Перед остаточним видаленням з кошика', true);
+            state.trash = state.trash.filter(x => x.id !== id); save('Остаточне видалення'); await showTrash(); toast('Запис стерто назавжди'); return;
+        }
+        if (action === 'empty-trash') {
+            if (!state.trash.length) return;
+            if (!(await requireAdmin('очистити кошик назавжди'))) return;
+            if (!confirm('Після цього записи зникнуть із кошика. Продовжити?')) return;
+            await createAutoBackup('Перед очищенням кошика', true);
+            state.trash = []; save('Очищення кошика'); closeModal(); render(); toast('Кошик очищено'); return;
+        }
+        if (action === 'restore-backup') {
+            if (!(await requireAdmin('відновити резервну копію'))) return;
+            const backups = await getBackups(); const b = backups.find(x => x.id === id); if (!b) { toast('Копію не знайдено'); return; }
+            if (!confirm('Замінити поточний стан даними з цієї автокопії? Поточний стан теж буде збережено.')) return;
+            await createAutoBackup('Перед відновленням старої копії', true);
+            state = Object.assign(Object.assign({}, blankState()), b.snapshot || {});
+            state.tutor = Object.assign(Object.assign({}, blankState().tutor), (state.tutor || {}));
+            state.students = Array.isArray(state.students) ? state.students : [];
+            state.groups = Array.isArray(state.groups) ? state.groups : [];
+            state.lessons = Array.isArray(state.lessons) ? state.lessons : [];
+            state.payments = Array.isArray(state.payments) ? state.payments : [];
+            state.packages = Array.isArray(state.packages) ? state.packages : [];
+            state.trash = Array.isArray(state.trash) ? state.trash : [];
+            save('Відновлення автокопії'); closeModal(); render(); toast('Автокопію відновлено'); return;
+        }
+        if (action === 'cloud') { showCloudPanel(); return; }
+        if (action === 'cloud-config') { showCloudConfigForm(); return; }
+        if (action === 'cloud-auth') { showCloudAuthForm(); return; }
+        if (action === 'cloud-key') { await showCloudKeyForm(); return; }
+        if (action === 'cloud-backup-now') {
+            try {
+                if (!cloudConfigured()) { showCloudConfigForm(); return; }
+                if (!(await ensureCloudSession())) { showCloudAuthForm(); return; }
+                if (!(await cloudMasterKey())) { await showCloudKeyForm(); return; }
+                toast('Шифрую та зберігаю…');
+                const ok = await cloudBackupNow('Ручна хмарна копія', true);
+                toast(ok ? 'Зашифровану хмарну копію створено' : 'Не вдалося створити копію');
+                render();
+            } catch (e) { toast(e.message || 'Помилка хмарної копії'); }
+            return;
+        }
+        if (action === 'cloud-history') { await showCloudBackups(); return; }
+        if (action === 'cloud-logout') {
+            setCloudSession(null);
+            localStorage.removeItem(CLOUD_MASTER_KEY);
+            setCloudMeta({ pending:false, lastError:'' });
+            closeModal(); render(); toast('Вихід виконано. Хмарні копії не видалено.'); return;
+        }
+        if (action === 'restore-cloud') {
+            if (!(await requireAdmin('відновити хмарну резервну копію'))) return;
+            try {
+                const rows = await listCloudBackups();
+                const row = rows.find(x => x.id === id);
+                if (!row) { toast('Хмарну копію не знайдено'); return; }
+                if (!confirm('Замінити поточний стан даними з цієї хмарної копії? Поточний стан буде збережено локально і в хмарі.')) return;
+                await createAutoBackup('Перед відновленням хмарної копії', true);
+                await cloudBackupNow('Перед відновленням хмарної копії', true);
+                const restored = await decryptCloudBackup(row);
+                state = Object.assign(Object.assign({}, blankState()), restored || {});
+                state.tutor = Object.assign(Object.assign({}, blankState().tutor), (state.tutor || {}));
+                state.students = Array.isArray(state.students) ? state.students : [];
+                state.groups = Array.isArray(state.groups) ? state.groups : [];
+                state.lessons = Array.isArray(state.lessons) ? state.lessons : [];
+                state.payments = Array.isArray(state.payments) ? state.payments : [];
+                state.packages = Array.isArray(state.packages) ? state.packages : [];
+                state.trash = Array.isArray(state.trash) ? state.trash : [];
+                save('Відновлення з хмари'); closeModal(); render(); toast('Хмарну копію відновлено');
+            } catch (e) { toast(e.message || 'Не вдалося відновити копію'); }
+            return;
+        }
+        if (action === 'delete-cloud') {
+            if (!(await requireAdmin('стерти хмарну резервну копію'))) return;
+            if (!confirm('Стерти цю зашифровану копію з хмари назавжди?')) return;
+            try { await deleteCloudBackup(id); await showCloudBackups(); toast('Хмарну копію стерто'); } catch (e) { toast(e.message || 'Не вдалося стерти копію'); }
+            return;
+        }
+        if (action === 'export') {
+            exportData();
+            return;
+        }
+        if (action === 'import') {
+            $('#importFile').click();
+            return;
+        }
+        if (action === 'demo') {
+            addDemoData();
+            return;
+        }
+        if (action === 'clear') {
+            if (!(await requireAdmin('очистити всі дані TutorNote'))) return;
+            if (confirm('Точно очистити ВСІ активні дані TutorNote? Перед очищенням буде створено захисну автокопію.')) {
+                await createAutoBackup('Перед повним очищенням', true);
+                state = blankState();
+                save('Повне очищення');
+                render();
+                toast('Активні дані очищено. Захисна копія збережена.');
+            }
+            return;
+        }
+        if (action === 'install') {
+            tryInstall();
+            return;
+        }
+    });
+    document.addEventListener('input', e => {
+        if (e.target.id === 'studentSearch')
+            renderStudents(e.target.value);
+    });
+    document.addEventListener('submit', async e => {
+        if (e.target.id === 'cloudConfigForm') {
+            e.preventDefault();
+            const fd = new FormData(e.target);
+            const url = normalizeCloudUrl(fd.get('url'));
+            const key = String(fd.get('key') || '').trim();
+            if (!/^https:\/\/.+\.supabase\.co$/i.test(url)) { toast('Перевірте Supabase Project URL'); return; }
+            if (!key) { toast('Вкажіть publishable / anon key'); return; }
+            setCloudConfig({ url, key });
+            setCloudSession(null);
+            localStorage.removeItem(CLOUD_MASTER_KEY);
+            setCloudMeta({ pending:false, lastError:'' });
+            toast('Хмарний проєкт збережено');
+            showCloudPanel();
+            return;
+        }
+        if (e.target.id === 'cloudAuthForm') {
+            e.preventDefault();
+            const fd = new FormData(e.target);
+            const mode = String(fd.get('mode') || 'login');
+            const email = String(fd.get('email') || '').trim();
+            const password = String(fd.get('password') || '');
+            try {
+                if (mode === 'signup') {
+                    const res = await cloudSignUp(email, password);
+                    if (!res || !res.access_token) { toast('Акаунт створено. Підтвердіть email, потім увійдіть.'); showCloudAuthForm(); return; }
+                    toast('Акаунт створено і вхід виконано');
+                } else {
+                    await cloudSignIn(email, password);
+                    toast('Вхід виконано');
+                }
+                await showCloudKeyForm();
+            } catch (err) { toast(err.message || 'Помилка входу'); }
+            return;
+        }
+        if (e.target.id === 'cloudKeyForm') {
+            e.preventDefault();
+            const fd = new FormData(e.target);
+            const mode = e.target.dataset.mode;
+            const passphrase = String(fd.get('passphrase') || '');
+            try {
+                if (mode === 'create') {
+                    if (passphrase !== String(fd.get('confirm') || '')) { toast('Фрази не збігаються'); return; }
+                    await createCloudEncryption(passphrase);
+                    toast('Ключ створено. Запишіть фразу відновлення окремо.');
+                } else {
+                    await recoverCloudEncryption(passphrase);
+                    toast('Ключ відновлено на цьому пристрої');
+                }
+                await cloudBackupNow('Перша зашифрована хмарна копія', true);
+                closeModal(); render();
+            } catch (err) { toast(err.message || 'Помилка ключа шифрування'); }
+            return;
+        }
+        if (e.target.id === 'lessonForm') {
+            e.preventDefault();
+            const f=new FormData(e.target), id=e.target.dataset.id, owner=ownerFromValue(f.get('owner'));
+            if(!owner){toast('Оберіть учня або групу');return;}
+            const data={studentId:owner.type==='student'?owner.id:'',groupId:owner.type==='group'?owner.id:'',date:f.get('date'),time:f.get('time'),duration:Number(f.get('duration')),subject:String(f.get('subject')||'').trim(),price:Number(f.get('price')||0),status:String(f.get('status')||'planned'),paid:f.get('paid')==='true',notes:String(f.get('notes')||'').trim()};
+            if(owner.type==='group'){data.groupPriceMode=groupPaymentMode(owner.entity);data.groupRate=Number(owner.entity.rate||0);data.groupMemberCount=Number((owner.entity.studentIds||[]).length||0);data.groupStudentIds=[...(owner.entity.studentIds||[])];}
+            if(blocksCalendar(data.status)&&hasConflict(data,id)){toast('Є накладка з іншим заняттям у цей час');return;}
+            let lesson;
+            if(id){lesson=lessonById(id);Object.assign(lesson,data);}else{lesson=Object.assign({id:uid('l')},data);state.lessons.push(lesson);}
+            reconcileLessonBilling(lesson);
+            save(id?'Оновлення заняття':'Нове заняття');
+            selectedDate=data.date;closeModal();render();toast(id?'Заняття оновлено':'Заняття додано');
+            return;
+        }
+        if (e.target.id === 'studentForm') {
+            e.preventDefault();
+            const f=new FormData(e.target), id=e.target.dataset.id, weeklySchedule=collectSchedule(e.target), scheduleStart=String(f.get('scheduleStart')||todayISO());
+            const data={name:String(f.get('name')||'').trim(),subject:String(f.get('subject')||'').trim(),phone:String(f.get('phone')||'').trim(),rate:Number(f.get('rate')||0),notes:String(f.get('notes')||'').trim(),weeklySchedule,scheduleStart};
+            if(id){
+                const student=studentById(id); if(!student)return;
+                const oldSchedule=JSON.parse(JSON.stringify(student.weeklySchedule||[])), oldStart=student.scheduleStart||todayISO();
+                if(scheduleChanged(oldSchedule,weeklySchedule,oldStart,scheduleStart)){recurringDecisionModal('student',id,data,weeklySchedule,scheduleStart,oldSchedule,oldStart);return;}
+                Object.assign(student,data);refreshFutureSeriesPricing('student',student.id,student);syncRecurringLessons('student',student.id,student.weeklySchedule,student.scheduleStart,student,false);save('Оновлення учня');closeModal();render();toast('Профіль оновлено');return;
+            }
+            const student=Object.assign({id:uid('s')},data);state.students.push(student);const recurring=syncRecurringLessons('student',student.id,weeklySchedule,scheduleStart,student,true);save('Новий учень і розклад');closeModal();render();toast(`Учня додано${weeklySchedule.length?` • ${recurring.created} занять у календарі${recurring.skipped?` • ${recurring.skipped} пропущено через накладки`:''}`:''}`);return;
+        }
+        if (e.target.id === 'groupForm') {
+            e.preventDefault();
+            const f=new FormData(e.target), id=e.target.dataset.id, weeklySchedule=collectSchedule(e.target), scheduleStart=String(f.get('scheduleStart')||todayISO()), studentIds=f.getAll('memberId').map(String);
+            const data={name:String(f.get('name')||'').trim(),subject:String(f.get('subject')||'').trim(),rate:Number(f.get('rate')||0),priceMode:String(f.get('priceMode')||'per_student'),notes:String(f.get('notes')||'').trim(),studentIds,weeklySchedule,scheduleStart};
+            if(id){
+                const group=groupById(id);if(!group)return;
+                const oldSchedule=JSON.parse(JSON.stringify(group.weeklySchedule||[])), oldStart=group.scheduleStart||todayISO();
+                if(scheduleChanged(oldSchedule,weeklySchedule,oldStart,scheduleStart)){recurringDecisionModal('group',id,data,weeklySchedule,scheduleStart,oldSchedule,oldStart);return;}
+                Object.assign(group,data);refreshFutureSeriesPricing('group',group.id,group);syncRecurringLessons('group',group.id,group.weeklySchedule,group.scheduleStart,group,false);save('Оновлення групи');peopleView='groups';closeModal();render();toast('Групу оновлено');return;
+            }
+            const group=Object.assign({id:uid('g')},data);state.groups.push(group);const recurring=syncRecurringLessons('group',group.id,weeklySchedule,scheduleStart,group,true);save('Нова група і розклад');peopleView='groups';closeModal();render();toast(`Групу створено${weeklySchedule.length?` • ${recurring.created} занять у календарі${recurring.skipped?` • ${recurring.skipped} пропущено через накладки`:''}`:''}`);return;
+        }
+        if (e.target.id === 'paymentForm') {
+            e.preventDefault();
+            const f=new FormData(e.target), id=e.target.dataset.id, lessonId=e.target.dataset.lessonId, target=ownerFromValue(f.get('target'));
+            if(!target){toast('Оберіть учня або групу');return;}
+            const data={studentId:target.type==='student'?target.id:'',groupId:target.type==='group'?target.id:'',amount:Number(f.get('amount')||0),date:f.get('date'),method:f.get('method'),note:String(f.get('note')||'').trim(),lessonId:lessonId||'',createdAt:new Date().toISOString()};
+            if(id){const old=paymentById(id);Object.assign(old,data,{createdAt:old.createdAt||data.createdAt});}else state.payments.push(Object.assign({id:uid('p')},data));
+            if(lessonId){const l=lessonById(lessonId);if(l)l.paid=true;}
+            save(id?'Оновлення оплати':'Нова оплата');closeModal();render();toast(id?'Оплату оновлено':'Оплату зафіксовано');return;
+        }
+        if (e.target.id === 'packageForm') {
+            e.preventDefault();
+            const f=new FormData(e.target), studentId=e.target.dataset.studentRef, student=studentById(studentId);if(!student)return;
+            const pkg={id:uid('pkg'),studentId,lessonsTotal:Number(f.get('lessonsTotal')||0),totalPrice:Number(f.get('totalPrice')||0),purchasedAt:String(f.get('purchasedAt')||todayISO()),active:true,createdAt:new Date().toISOString()};
+            if(pkg.lessonsTotal<1){toast('Вкажіть кількість занять');return;}
+            state.packages.push(pkg);
+            if(f.get('recordPayment')==='on'){const payment={id:uid('p'),studentId,groupId:'',amount:pkg.totalPrice,date:pkg.purchasedAt,method:'Переказ',note:`Абонемент на ${pkg.lessonsTotal} занять`,packageId:pkg.id,createdAt:new Date().toISOString()};state.payments.push(payment);pkg.paymentId=payment.id;}
+            save('Новий абонемент');closeModal();studentProfile(studentId);toast('Абонемент створено');return;
+        }
+        if (e.target.id === 'rescheduleForm') {
+            e.preventDefault();
+            const f=new FormData(e.target), old=lessonById(e.target.dataset.id);if(!old)return;
+            const newDate=String(f.get('date')), newTime=String(f.get('time'));
+            const fresh=Object.assign({},old,{id:uid('l'),date:newDate,time:newTime,status:'planned',paid:false,autoRecurring:false,rescheduledFromId:old.id,notes:old.notes||''});
+            delete fresh.billing;delete fresh.movedToDate;delete fresh.movedToTime;delete fresh.movedToId;
+            if(hasConflict(fresh)){toast('На новий час уже є інше заняття');return;}
+            if(old.autoRecurring)addRecurrenceException(old);
+            old.status='moved';old.movedToDate=newDate;old.movedToTime=newTime;old.movedToId=fresh.id;old.autoRecurring=false;reconcileLessonBilling(old);
+            state.lessons.push(fresh);save('Перенесення заняття');selectedDate=newDate;closeModal();render();toast('Заняття перенесено');return;
+        }
+    });
+    $('#modalClose').addEventListener('click', closeModal);
+    modalBackdrop.addEventListener('click', e => { if (e.target === modalBackdrop)
+        closeModal(); });
+    fab.addEventListener('click', () => {
+        if (currentPage === 'schedule')
+            lessonForm();
+        else if (currentPage === 'students')
+            peopleView === 'groups' ? groupForm() : studentForm();
+        else if (currentPage === 'payments')
+            paymentForm();
+        else
+            quickAdd();
+    });
+    $('#importFile').addEventListener('change', async (e) => {
+        var _a;
+        const file = (_a = e.target.files) === null || _a === void 0 ? void 0 : _a[0];
+        if (!file)
+            return;
+        try {
+            const parsed = JSON.parse(await readFileAsText(file));
+            if (!parsed || !Array.isArray(parsed.students) || !Array.isArray(parsed.lessons) || !Array.isArray(parsed.payments))
+                throw new Error('Невірний формат');
+            if (!(await requireAdmin('імпортувати дані з файлу'))) { e.target.value = ''; return; }
+            if (confirm('Замінити поточні дані даними з резервної копії? Поточний стан буде автоматично збережено.')) {
+                await createAutoBackup('Перед імпортом JSON', true);
+                state = Object.assign(Object.assign(Object.assign({}, blankState()), parsed), { tutor: Object.assign(Object.assign({}, blankState().tutor), (parsed.tutor || {})), groups: Array.isArray(parsed.groups) ? parsed.groups : [], trash: Array.isArray(parsed.trash) ? parsed.trash : [] });
+                save('Імпорт JSON');
+                render();
+                toast('Резервну копію відновлено');
+            }
+        }
+        catch (err) {
+            toast('Не вдалося прочитати файл резервної копії');
+        }
+        e.target.value = '';
+    });
+    window.addEventListener('online', () => {
+        const m = getCloudMeta();
+        if (m.pending) scheduleCloudBackup(m.pendingReason || 'Відкладена автокопія');
+    });
+    window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); deferredPrompt = e; installBtn.style.display = 'grid'; });
+    window.addEventListener('appinstalled', () => { deferredPrompt = null; toast('TutorNote встановлено'); });
+    installBtn.addEventListener('click', tryInstall);
+    async function tryInstall() {
+        if (deferredPrompt) {
+            deferredPrompt.prompt();
+            await deferredPrompt.userChoice;
+            deferredPrompt = null;
+            return;
+        }
+        toast('У меню браузера виберіть «Додати на головний екран»');
+    }
+    // Service worker works only over http(s), while the standalone file still works via file://.
+    if ('serviceWorker' in navigator && /^https?:$/.test(location.protocol))
+        navigator.serviceWorker.register('./sw.js').catch(() => { });
+    const recurringExtended = ensureRecurringHorizon();
+    if (recurringExtended) save('Автоматичне продовження регулярного розкладу');
+    render();
+    createAutoBackup('Початковий знімок');
+})();

@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#151826" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="TutorNote" />
+  <meta name="format-detection" content="telephone=no" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <title>TutorNote</title>
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="icon" href="icon-192.png" sizes="192x192" />
+  <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div>
+        <div class="eyebrow" id="todayLabel"></div>
+        <h1 id="pageTitle">TutorNote</h1>
+      </div>
+      <div class="top-actions">
+        <button class="icon-btn" id="installBtn" title="Встановити застосунок" aria-label="Встановити застосунок">＋</button>
+        <button class="avatar-btn" data-go="settings" aria-label="Налаштування">TN</button>
+      </div>
+    </header>
+
+    <main id="app" class="content" aria-live="polite"></main>
+
+    <button class="fab" id="fab" aria-label="Швидко додати">＋</button>
+
+    <nav class="bottom-nav" aria-label="Головна навігація">
+      <button class="nav-item active" data-page="home"><span>⌂</span><small>Головна</small></button>
+      <button class="nav-item" data-page="schedule"><span>▦</span><small>Розклад</small></button>
+      <button class="nav-item" data-page="students"><span>♙</span><small>Учні</small></button>
+      <button class="nav-item" data-page="payments"><span>₴</span><small>Оплати</small></button>
+      <button class="nav-item" data-page="settings"><span>⚙</span><small>Ще</small></button>
+    </nav>
+  </div>
+
+  <div class="modal-backdrop hidden" id="modalBackdrop">
+    <section class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <div class="modal-head">
+        <div>
+          <div class="eyebrow">TutorNote</div>
+          <h2 id="modalTitle">Додати</h2>
+        </div>
+        <button class="icon-btn" id="modalClose" aria-label="Закрити">×</button>
+      </div>
+      <div id="modalBody"></div>
+    </section>
+  </div>
+
+  <div class="toast" id="toast"></div>
+  <input type="file" id="importFile" accept="application/json" hidden />
+
+  <script src="app.js?v=6" defer></script>
+</body>
+</html>
